@@ -30,8 +30,10 @@ type ExecRunner = Runner
 
 // NewRunner returns the production os/exec runner with standard streams.
 func NewRunner() Runner { return Runner{} }
+
 // Executor is an alternate name for Runner.
 type Executor = Runner
+
 // OSRunner is an explicit name for the production os/exec implementation.
 type OSRunner = Runner
 
@@ -41,6 +43,16 @@ type OSRunner = Runner
 // caused termination, ctx.Err is returned so callers can distinguish timeout
 // from an ordinary command failure.
 func (r Runner) Run(ctx context.Context, args []string) (int, error) {
+	return r.run(ctx, args, nil)
+}
+
+// RunWithEnvironment runs a command with invocation metadata merged into the
+// configured environment. It never invokes a shell and never mutates r.Env.
+func (r Runner) RunWithEnvironment(ctx context.Context, args []string, env map[string]string) (int, error) {
+	return r.run(ctx, args, env)
+}
+
+func (r Runner) run(ctx context.Context, args []string, env map[string]string) (int, error) {
 	if ctx == nil {
 		return -1, errors.New("nil context")
 	}
@@ -66,6 +78,12 @@ func (r Runner) Run(ctx context.Context, args []string) (int, error) {
 	}
 	if r.Env != nil {
 		cmd.Env = append([]string(nil), r.Env...)
+	}
+	if env != nil {
+		if cmd.Env == nil {
+			cmd.Env = os.Environ()
+		}
+		cmd.Env = MergeEnvironment(cmd.Env, env)
 	}
 
 	err := cmd.Run()

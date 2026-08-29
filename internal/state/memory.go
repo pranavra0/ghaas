@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 	"sync"
@@ -34,11 +35,20 @@ func (m *Memory) Get(ctx context.Context, function string, id invocation.Invocat
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
+	if _, err := canonicalInvocationID(function, id); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	v, ok := m.records[recordKey{function: function, id: id}]
 	m.mu.RUnlock()
 	if !ok {
 		return nil, ErrNotFound
+	}
+	if v.Function != function || v.ID != id {
+		return nil, fmt.Errorf("%w: stored record identity mismatch", invocation.ErrInvalidInvocation)
+	}
+	if err := validateRecord(v); err != nil {
+		return nil, err
 	}
 	copy := clone(v)
 	return &copy, nil
@@ -74,8 +84,8 @@ func (m *Memory) CompareAndSwap(ctx context.Context, previous, next invocation.I
 	if err := validateRecord(next); err != nil {
 		return err
 	}
-	if previous.Function != next.Function || previous.ID != next.ID {
-		return ErrConflict
+	if err := validateCAS(previous, next); err != nil {
+		return err
 	}
 	key := recordKey{function: previous.Function, id: previous.ID}
 	m.mu.Lock()
@@ -83,6 +93,12 @@ func (m *Memory) CompareAndSwap(ctx context.Context, previous, next invocation.I
 	current, exists := m.records[key]
 	if !exists {
 		return ErrNotFound
+	}
+	if current.Function != previous.Function || current.ID != previous.ID {
+		return fmt.Errorf("%w: stored record identity mismatch", invocation.ErrInvalidInvocation)
+	}
+	if err := validateRecord(current); err != nil {
+		return err
 	}
 	if !reflect.DeepEqual(current, previous) {
 		return ErrConflict
@@ -95,10 +111,23 @@ func (m *Memory) List(ctx context.Context, function string, limit int) ([]invoca
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
+	if function != "" {
+		if err := validateFunction(function); err != nil {
+			return nil, err
+		}
+	}
 	m.mu.RLock()
 	items := make([]invocation.Invocation, 0, len(m.records))
 	for key, v := range m.records {
-		if key.function == function {
+		if err := validateRecord(v); err != nil {
+			m.mu.RUnlock()
+			return nil, err
+		}
+		if key.function != v.Function || key.id != v.ID {
+			m.mu.RUnlock()
+			return nil, fmt.Errorf("%w: stored record identity mismatch", invocation.ErrInvalidInvocation)
+		}
+		if key.function == function || function == "" {
 			items = append(items, clone(v))
 		}
 	}
@@ -116,8 +145,22 @@ func (m *Memory) List(ctx context.Context, function string, limit int) ([]invoca
 }
 
 func validateRecord(v invocation.Invocation) error {
+	if v.SchemaVersion != 1 {
+		return fmt.Errorf("%w: schema version must be 1", invocation.ErrInvalidInvocation)
+	}
 	if err := v.Validate(); err != nil {
 		return err
+	}
+	if _, err := canonicalInvocationID(v.Function, v.ID); err != nil {
+		return err
+	}
+	// Terminal and completed-failure records must carry a complete result/
+	// history. Pending and running records retain compatibility with older
+	// callers that populated metadata incrementally before issuing CAS.
+	if v.Status == invocation.StatusFailed || v.Status.IsTerminal() {
+		if err := v.ValidateStrict(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -130,6 +173,10 @@ func clone(v invocation.Invocation) invocation.Invocation {
 	if v.CompletedAt != nil {
 		t := *v.CompletedAt
 		v.CompletedAt = &t
+	}
+	if v.Lease != nil {
+		l := *v.Lease
+		v.Lease = &l
 	}
 	if v.Result != nil {
 		r := *v.Result
@@ -151,5 +198,6 @@ func contextError(ctx context.Context) error {
 }
 
 var _ Store = (*Memory)(nil)
+
 // MemoryStore is an alternate name for the v0.1 memory backend.
 type MemoryStore = Memory

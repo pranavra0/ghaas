@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"ghaas/internal/github"
+	"ghaas/internal/invocation"
 )
 
 const defaultManifest = "ghaas.yaml"
@@ -37,14 +38,26 @@ type Services struct {
 	FunctionNames func(manifest any) []string
 	Compile       func(manifest any, function string) (Compiled, error)
 
-	GitHub       github.GitHub
-	NewGitHub    func() (github.GitHub, error)
-	DefaultRef   string
-	WorkflowFor  func(function string) string
-	Version      string
-	InitTemplate string
-	Stdout       io.Writer
-	Stderr       io.Writer
+	GitHub    github.GitHub
+	NewGitHub func() (github.GitHub, error)
+	// State is optional for compatibility with stateless clients. When
+	// configured, invoke records a pending logical invocation and status/logs
+	// prefer that record over the provider's workflow-run view.
+	State    invocation.StateStore
+	NewState func() (invocation.StateStore, error)
+	// StateFor allows applications to select a backend from the validated
+	// manifest/function (for example memory versus branch state). State and
+	// NewState remain the compatibility defaults.
+	StateFor func(manifest any, function string) (invocation.StateStore, error)
+	// NewInvocationID is injectable for deterministic tests and alternate
+	// identity providers. It must return a function-scoped invocation ID.
+	NewInvocationID func(function string) (invocation.InvocationID, error)
+	DefaultRef      string
+	WorkflowFor     func(function string) string
+	Version         string
+	InitTemplate    string
+	Stdout          io.Writer
+	Stderr          io.Writer
 }
 
 // Dependencies is an alternate, descriptive name for Services.
@@ -87,6 +100,9 @@ func New(services Services) *Root { return NewRoot(services) }
 func (r *Root) Execute(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return errors.New("usage: ghaas <init|validate|generate|deploy|invoke|status|logs|version>")
+	}
+	if args[0] == "--version" || args[0] == "-v" {
+		return r.version(args[1:])
 	}
 	switch args[0] {
 	case "init":
@@ -139,6 +155,12 @@ func (r *Root) init(args []string) error {
 	}
 	if fs.NArg() != 0 {
 		return errors.New("init does not accept positional arguments")
+	}
+	if err := rejectSymlinkPath(filepath.Dir(r.services.ManifestPath)); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(r.services.ManifestPath), 0o755); err != nil {
+		return fmt.Errorf("create manifest directory: %w", err)
 	}
 	if err := rejectSymlinkPath(filepath.Dir(r.services.ManifestPath)); err != nil {
 		return err
@@ -244,7 +266,7 @@ func (r *Root) generate(args []string) error {
 		}
 		if len(functions) > 1 {
 			if i > 0 {
-				fmt.Fprintln(r.services.Stdout)
+				fmt.Fprintln(r.services.Stdout, "---")
 			}
 			fmt.Fprintf(r.services.Stdout, "# %s\n", function)
 		}
@@ -308,6 +330,9 @@ func (r *Root) deploy(args []string) error {
 		pendingWorkflows = append(pendingWorkflows, pending{name: name, path: path, content: []byte(compiled.Content)})
 	}
 	for _, workflow := range pendingWorkflows {
+		if symlinkErr := rejectSymlinkPath(workflow.path); symlinkErr != nil {
+			return symlinkErr
+		}
 		existing, readErr := os.ReadFile(workflow.path)
 		matches := readErr == nil && string(existing) == string(workflow.content)
 		if *check {
@@ -326,7 +351,11 @@ func (r *Root) deploy(args []string) error {
 		}
 		fmt.Fprintf(r.services.Stdout, "deployed %s\n", workflow.name)
 	}
-	if *check {
+	if *check && *function == "" {
+		// A full check owns the generated workflow set and therefore reports
+		// stale ghaas-* files. A function-scoped check deliberately compares
+		// only the selected artifact so unrelated functions can be checked in
+		// isolation.
 		expected := make(map[string]struct{}, len(pendingWorkflows))
 		for _, workflow := range pendingWorkflows {
 			expected[filepath.Clean(workflow.path)] = struct{}{}
@@ -426,7 +455,76 @@ func (r *Root) client() (github.GitHub, error) {
 	if r.services.NewGitHub == nil {
 		return nil, errors.New("GitHub client is not configured")
 	}
-	return r.services.NewGitHub()
+	client, err := r.services.NewGitHub()
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		return nil, errors.New("GitHub constructor returned nil client")
+	}
+	return client, nil
+}
+
+func (r *Root) stateStore(manifest any, function string) (invocation.StateStore, error) {
+	if r.services.StateFor != nil {
+		store, err := r.services.StateFor(manifest, function)
+		if err != nil {
+			return nil, err
+		}
+		if store == nil {
+			return nil, errors.New("state selector returned nil store")
+		}
+		return store, nil
+	}
+	if r.services.State != nil {
+		return r.services.State, nil
+	}
+	if r.services.NewState == nil {
+		return nil, nil
+	}
+	store, err := r.services.NewState()
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, errors.New("state constructor returned nil store")
+	}
+	// Keep one store for all handlers in this process. This is important for
+	// callers that use Root as an embeddable control plane.
+	r.services.State = store
+	return store, nil
+}
+
+func (r *Root) invocationID(function string) (invocation.InvocationID, error) {
+	if r.services.NewInvocationID != nil {
+		id, err := r.services.NewInvocationID(function)
+		if err != nil {
+			return "", err
+		}
+		if err := invocation.ValidateInvocationID(id); err != nil {
+			return "", fmt.Errorf("invalid invocation ID: %w", err)
+		}
+		if !strings.HasPrefix(string(id), function+"/") {
+			return "", fmt.Errorf("invocation ID %q does not belong to function %q", id, function)
+		}
+		return id, nil
+	}
+	uuid, err := newInvocationUUID()
+	if err != nil {
+		return "", err
+	}
+	return invocation.NewManualID(function, uuid)
+}
+
+func newInvocationUUID() (string, error) {
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("generate invocation UUID: %w", err)
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	return hex.EncodeToString(raw[:4]) + "-" + hex.EncodeToString(raw[4:6]) + "-" +
+		hex.EncodeToString(raw[6:8]) + "-" + hex.EncodeToString(raw[8:10]) + "-" + hex.EncodeToString(raw[10:]), nil
 }
 
 func (r *Root) invoke(ctx context.Context, args []string) error {
@@ -440,6 +538,9 @@ func (r *Root) invoke(ctx context.Context, args []string) error {
 		return errors.New("usage: ghaas invoke [--ref REF] FUNCTION")
 	}
 	name := fs.Arg(0)
+	if strings.TrimSpace(name) == "" {
+		return errors.New("function name is required")
+	}
 	manifest, err := r.loadAndValidate()
 	if err != nil {
 		return err
@@ -451,32 +552,381 @@ func (r *Root) invoke(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	uuid, err := newInvocationUUID()
+	id, err := r.invocationID(name)
 	if err != nil {
 		return err
 	}
-	inputs := map[string]string{"ghaas_invocation_id": uuid}
+	store, err := r.stateStore(manifest, name)
+	if err != nil {
+		return err
+	}
+	if store != nil {
+		record := invocation.Invocation{
+			SchemaVersion: 1,
+			Function:      name,
+			ID:            id,
+			Status:        invocation.StatusPending,
+			Attempts:      0,
+			CreatedAt:     time.Now().UTC(),
+		}
+		if createErr := store.Create(ctx, record); createErr != nil {
+			if !errors.Is(createErr, invocation.ErrConflict) {
+				return fmt.Errorf("record invocation %s: %w", id, createErr)
+			}
+			// An injected deterministic ID can legitimately already exist.
+			// Reusing a terminal record would dispatch a duplicate logical
+			// invocation, so fail closed instead.
+			existing, getErr := store.Get(ctx, name, id)
+			if getErr != nil {
+				return fmt.Errorf("record invocation %s: %w", id, createErr)
+			}
+			if existing != nil && existing.Status.IsTerminal() {
+				return fmt.Errorf("invocation %s is already %s", id, existing.Status)
+			}
+			return fmt.Errorf("invocation %s already exists", id)
+		}
+	}
+	// The workflow compiler declares this exact input name. Keep the UUID
+	// function-scoped in the state ID while passing only its key to Actions.
+	inputs := map[string]string{"ghaas_invocation_id": string(id)}
 	if err := client.DispatchWorkflow(ctx, r.services.WorkflowFor(name), *ref, inputs); err != nil {
 		return err
 	}
 	fmt.Fprintf(r.services.Stdout, "dispatched %s\n", name)
+	fmt.Fprintf(r.services.Stdout, "invocation: %s\n", id)
 	return nil
 }
-func newInvocationUUID() (string, error) {
-	raw := make([]byte, 16)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("generate invocation UUID: %w", err)
+func formatInvocationStatus(out io.Writer, record invocation.Invocation) {
+	fmt.Fprintln(out, "Function:", record.Function)
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Last logical invocation:")
+	fmt.Fprintf(out, "  ID:       %s\n", record.ID)
+	fmt.Fprintf(out, "  Status:   %s\n", record.Status)
+	fmt.Fprintf(out, "  Attempts: %d\n", record.Attempts)
+	if record.WorkflowRunID > 0 {
+		fmt.Fprintf(out, "  Workflow run: %d\n", record.WorkflowRunID)
 	}
-	raw[6] = (raw[6] & 0x0f) | 0x40
-	raw[8] = (raw[8] & 0x3f) | 0x80
-	return hex.EncodeToString(raw[:4]) + "-" + hex.EncodeToString(raw[4:6]) + "-" +
-		hex.EncodeToString(raw[6:8]) + "-" + hex.EncodeToString(raw[8:10]) + "-" + hex.EncodeToString(raw[10:]), nil
+	if record.StartedAt != nil {
+		fmt.Fprintf(out, "  Started:  %s\n", record.StartedAt.Format(time.RFC3339))
+	}
+	if record.StartedAt != nil {
+		end := time.Now().UTC()
+		if record.CompletedAt != nil {
+			end = *record.CompletedAt
+		}
+		if end.After(*record.StartedAt) {
+			fmt.Fprintf(out, "  Duration: %.1fs\n", end.Sub(*record.StartedAt).Seconds())
+		}
+	}
+	if record.Result != nil && record.Result.Error != "" {
+		fmt.Fprintf(out, "  Error:    %s\n", record.Result.Error)
+	}
+}
+
+func latestInvocation(records []invocation.Invocation) (invocation.Invocation, bool) {
+	if len(records) == 0 {
+		return invocation.Invocation{}, false
+	}
+	latest := records[0]
+	for _, candidate := range records[1:] {
+		if candidate.CreatedAt.After(latest.CreatedAt) ||
+			(candidate.CreatedAt.Equal(latest.CreatedAt) && string(candidate.ID) > string(latest.ID)) {
+			latest = candidate
+		}
+	}
+	return latest, true
+}
+
+type providerRunState struct {
+	status  invocation.InvocationStatus
+	skipped bool
+}
+
+// classifyWorkflowRun translates the provider's state vocabulary into the
+// logical invocation state machine. A skipped Actions run is intentionally
+// kept separate: duplicate runs do not create a logical invocation record.
+func classifyWorkflowRun(run github.WorkflowRun) providerRunState {
+	conclusion := strings.ToLower(strings.TrimSpace(run.Conclusion))
+	switch conclusion {
+	case "success":
+		return providerRunState{status: invocation.StatusSucceeded}
+	case "skipped":
+		return providerRunState{skipped: true}
+	case "failure", "cancelled", "timed_out", "action_required", "stale", "startup_failure", "neutral":
+		return providerRunState{status: invocation.StatusFailed}
+	}
+
+	switch strings.ToLower(strings.TrimSpace(run.Status)) {
+	case "queued", "requested", "waiting", "pending", "in_progress":
+		return providerRunState{status: invocation.StatusRunning}
+	case "success":
+		return providerRunState{status: invocation.StatusSucceeded}
+	case "failure", "cancelled", "timed_out":
+		return providerRunState{status: invocation.StatusFailed}
+	case "completed":
+		// GitHub normally supplies a conclusion for completed runs. Treat an
+		// omitted conclusion conservatively as a failed provider result rather
+		// than leaving a logical invocation pending forever.
+		return providerRunState{status: invocation.StatusFailed}
+	default:
+		return providerRunState{}
+	}
+}
+
+func workflowRunTime(run github.WorkflowRun, fallback time.Time) time.Time {
+	if run.StartedAt != nil && !run.StartedAt.IsZero() {
+		return run.StartedAt.UTC()
+	}
+	if !run.CreatedAt.IsZero() {
+		return run.CreatedAt.UTC()
+	}
+	if !fallback.IsZero() {
+		return fallback.UTC()
+	}
+	return time.Now().UTC()
+}
+
+func workflowRunCompletionTime(run github.WorkflowRun, started time.Time) time.Time {
+	completed := run.UpdatedAt
+	if completed.IsZero() {
+		completed = run.CreatedAt
+	}
+	if completed.IsZero() {
+		completed = time.Now().UTC()
+	}
+	completed = completed.UTC()
+	if !started.IsZero() && completed.Before(started) {
+		completed = started
+	}
+	return completed
+}
+
+func workflowRunHasInvocationID(run github.WorkflowRun, id invocation.InvocationID) bool {
+	value := string(id)
+	name := strings.TrimSpace(run.Name)
+	workflow := strings.TrimSpace(run.Workflow)
+	return strings.Contains(name, value) || strings.Contains(workflow, value)
+}
+
+// workflowRunForInvocation finds the provider run corresponding to a logical
+// record. A persisted run ID or provider-exposed invocation metadata is an
+// exact association. For status reconciliation only, a run created after a
+// pending record is a useful fallback because workflow_dispatch does not
+// return a run ID; callers that require an exact target pass strict=true.
+func workflowRunForInvocation(record invocation.Invocation, runs []github.WorkflowRun, strict bool) (github.WorkflowRun, bool) {
+	existingRunID := record.WorkflowRunID
+	previousAttemptTerminal := false
+	if existingRunID > 0 {
+		for _, run := range runs {
+			if run.ID != existingRunID {
+				continue
+			}
+			provider := classifyWorkflowRun(run)
+			if record.Status == invocation.StatusPending && record.Attempts > 0 &&
+				(provider.status == invocation.StatusSucceeded || provider.status == invocation.StatusFailed) {
+				// Retry keeps the previous attempt's run ID for history. Do
+				// not replay that terminal attempt while the retry is pending.
+				previousAttemptTerminal = true
+				break
+			}
+			return run, true
+		}
+	}
+	for _, run := range runs {
+		if run.ID > 0 && workflowRunHasInvocationID(run, record.ID) &&
+			(!previousAttemptTerminal || run.ID != existingRunID) {
+			return run, true
+		}
+	}
+	if strict || record.CreatedAt.IsZero() {
+		return github.WorkflowRun{}, false
+	}
+	if len(runs) == 1 && runs[0].ID > 0 && runs[0].ID != existingRunID {
+		// Some provider fakes and older API adapters omit timestamps. A
+		// singleton run is still an unambiguous reconciliation candidate for
+		// status, while strict callers continue to reject all heuristics.
+		return runs[0], true
+	}
+
+	var selected github.WorkflowRun
+	var selectedAt time.Time
+	found := false
+	for _, run := range runs {
+		created := run.CreatedAt
+		if created.IsZero() && run.StartedAt != nil {
+			created = *run.StartedAt
+		}
+		if run.ID <= 0 || run.ID == existingRunID || created.IsZero() || created.Before(record.CreatedAt) {
+			continue
+		}
+		if !found || created.Before(selectedAt) ||
+			(created.Equal(selectedAt) && run.ID < selected.ID) {
+			selected = run
+			selectedAt = created
+			found = true
+		}
+	}
+	return selected, found
+}
+
+func invocationTimesEqual(left, right *time.Time) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return left.Equal(*right)
+}
+
+func reconcileInvocation(ctx context.Context, store invocation.StateStore, current invocation.Invocation, run github.WorkflowRun) (invocation.Invocation, error) {
+	if run.ID <= 0 || (current.Status != invocation.StatusPending && current.Status != invocation.StatusRunning) {
+		return current, nil
+	}
+	provider := classifyWorkflowRun(run)
+	if provider.skipped || provider.status == "" {
+		return current, nil
+	}
+
+	next := current
+	if current.Status == invocation.StatusPending {
+		started := workflowRunTime(run, current.CreatedAt)
+		if started.Before(current.CreatedAt) {
+			started = current.CreatedAt
+		}
+		var err error
+		next, err = invocation.Start(current, started, run.ID)
+		if err != nil {
+			return current, err
+		}
+	} else {
+		if next.WorkflowRunID == 0 {
+			next.WorkflowRunID = run.ID
+		}
+		if next.StartedAt == nil {
+			started := workflowRunTime(run, current.CreatedAt)
+			if started.Before(current.CreatedAt) {
+				started = current.CreatedAt
+			}
+			next.StartedAt = &started
+		}
+	}
+
+	if provider.status == invocation.StatusSucceeded || provider.status == invocation.StatusFailed {
+		started := current.CreatedAt
+		if next.StartedAt != nil {
+			started = *next.StartedAt
+		}
+		finished := workflowRunCompletionTime(run, started)
+		result := invocation.InvocationResult{ExitCode: 0}
+		if provider.status == invocation.StatusFailed {
+			result.ExitCode = 1
+			conclusion := strings.TrimSpace(run.Conclusion)
+			if conclusion == "" {
+				conclusion = strings.TrimSpace(run.Status)
+			}
+			result.Error = "workflow run concluded " + strings.ToLower(conclusion)
+		}
+		var err error
+		if provider.status == invocation.StatusSucceeded {
+			next, err = invocation.Succeed(next, finished, result)
+		} else {
+			next, err = invocation.Fail(next, finished, result)
+		}
+		if err != nil {
+			return current, err
+		}
+	} else if next.WorkflowRunID == current.WorkflowRunID &&
+		invocationTimesEqual(next.StartedAt, current.StartedAt) {
+		return current, nil
+	}
+
+	if err := store.CompareAndSwap(ctx, current, next); err != nil {
+		if errors.Is(err, invocation.ErrConflict) {
+			latest, getErr := store.Get(ctx, current.Function, current.ID)
+			if getErr == nil && latest != nil {
+				return *latest, nil
+			}
+		}
+		return current, fmt.Errorf("reconcile invocation %s: %w", current.ID, err)
+	}
+	return next, nil
+}
+
+func reconcileInvocations(ctx context.Context, store invocation.StateStore, function string, runs []github.WorkflowRun, records []invocation.Invocation) ([]invocation.Invocation, error) {
+	reconciled := append([]invocation.Invocation(nil), records...)
+	used := make(map[int64]struct{}, len(records))
+	for _, record := range records {
+		if record.WorkflowRunID > 0 {
+			used[record.WorkflowRunID] = struct{}{}
+		}
+	}
+	for i, record := range records {
+		if record.Function != function ||
+			(record.Status != invocation.StatusPending && record.Status != invocation.StatusRunning) {
+			continue
+		}
+		run, ok := workflowRunForInvocation(record, runs, false)
+		if !ok || run.ID <= 0 {
+			continue
+		}
+		if _, exists := used[run.ID]; exists && record.WorkflowRunID != run.ID {
+			continue
+		}
+		used[run.ID] = struct{}{}
+		next, err := reconcileInvocation(ctx, store, record, run)
+		if err != nil {
+			return reconciled, err
+		}
+		reconciled[i] = next
+	}
+	return reconciled, nil
+}
+func printReliabilityWithRuns(out io.Writer, records []invocation.Invocation, runs []github.WorkflowRun) {
+	var successful, failed, skipped int
+	represented := make(map[int64]struct{}, len(records))
+	for _, record := range records {
+		if record.WorkflowRunID > 0 {
+			represented[record.WorkflowRunID] = struct{}{}
+		}
+		switch record.Status {
+		case invocation.StatusSucceeded:
+			successful++
+		case invocation.StatusFailed, invocation.StatusExhausted:
+			failed++
+		}
+	}
+	for _, run := range runs {
+		state := classifyWorkflowRun(run)
+		if run.ID > 0 {
+			if _, ok := represented[run.ID]; ok {
+				if state.skipped {
+					skipped++
+				}
+				continue
+			}
+		}
+		switch {
+		case state.skipped:
+			skipped++
+		case state.status == invocation.StatusSucceeded:
+			successful++
+		case state.status == invocation.StatusFailed:
+			failed++
+		}
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Recent reliability:")
+	fmt.Fprintf(out, "  successful: %d\n", successful)
+	fmt.Fprintf(out, "  failed:      %d\n", failed)
+	fmt.Fprintf(out, "  skipped:     %d\n", skipped)
+}
+
+func printReliability(out io.Writer, records []invocation.Invocation) {
+	printReliabilityWithRuns(out, records, nil)
 }
 
 func (r *Root) status(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeFlags(args)); err != nil {
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -490,21 +940,79 @@ func (r *Root) status(ctx context.Context, args []string) error {
 	if _, err := r.selectedFunctions(manifest, name); err != nil {
 		return err
 	}
-	client, err := r.client()
+
+	store, err := r.stateStore(manifest, name)
 	if err != nil {
 		return err
 	}
-	runs, err := client.ListWorkflowRuns(ctx, r.services.WorkflowFor(name), 10)
-	if err != nil {
-		return err
+	var records []invocation.Invocation
+	if store != nil {
+		records, err = store.List(ctx, name, 0)
+		if err != nil {
+			return fmt.Errorf("list invocations for %s: %w", name, err)
+		}
 	}
+
+	providerConfigured := r.services.GitHub != nil || r.services.NewGitHub != nil
+	needProvider := store == nil || len(records) == 0
+	for _, record := range records {
+		if record.Status == invocation.StatusPending || record.Status == invocation.StatusRunning {
+			needProvider = true
+			break
+		}
+	}
+	var runs []github.WorkflowRun
+	runsLoaded := false
+	if providerConfigured && (needProvider || store != nil) {
+		client, clientErr := r.client()
+		if clientErr != nil {
+			if len(records) == 0 || needProvider {
+				return clientErr
+			}
+		} else {
+			runs, err = client.ListWorkflowRuns(ctx, r.services.WorkflowFor(name), 10)
+			if err != nil {
+				if len(records) == 0 || needProvider {
+					return err
+				}
+			} else {
+				runsLoaded = true
+				if store != nil && len(records) > 0 {
+					records, err = reconcileInvocations(ctx, store, name, runs, records)
+					if err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+
+	if latest, ok := latestInvocation(records); ok {
+		formatInvocationStatus(r.services.Stdout, latest)
+		printReliabilityWithRuns(r.services.Stdout, records, runs)
+		return nil
+	}
+
+	if !runsLoaded {
+		client, err := r.client()
+		if err != nil {
+			return err
+		}
+		runs, err = client.ListWorkflowRuns(ctx, r.services.WorkflowFor(name), 10)
+		if err != nil {
+			return err
+		}
+		runsLoaded = true
+	}
+
 	if len(runs) == 0 {
 		fmt.Fprintln(r.services.Stdout, "Status: no runs")
 		return nil
 	}
 	latest := runs[0]
 	for _, run := range runs[1:] {
-		if run.CreatedAt.After(latest.CreatedAt) {
+		if run.CreatedAt.After(latest.CreatedAt) ||
+			(run.CreatedAt.Equal(latest.CreatedAt) && run.ID > latest.ID) {
 			latest = run
 		}
 	}
@@ -522,13 +1030,14 @@ func (r *Root) status(ctx context.Context, args []string) error {
 	if !started.IsZero() {
 		fmt.Fprintf(r.services.Stdout, "Started: %s\n", started.Format(time.RFC3339))
 	}
+	printReliabilityWithRuns(r.services.Stdout, nil, runs)
 	return nil
 }
 
 func (r *Root) logs(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
-	invocation := fs.String("invocation", "", "logical invocation ID or workflow run ID")
+	invocationID := fs.String("invocation", "", "logical invocation ID or workflow run ID")
 	if err := fs.Parse(normalizeFlags(args)); err != nil {
 		return err
 	}
@@ -543,43 +1052,107 @@ func (r *Root) logs(ctx context.Context, args []string) error {
 	if _, err := r.selectedFunctions(manifest, name); err != nil {
 		return err
 	}
+
+	store, err := r.stateStore(manifest, name)
+	if err != nil {
+		return err
+	}
+	explicit := strings.TrimSpace(*invocationID)
+	var logical *invocation.Invocation
+	var runID int64
+	if explicit != "" {
+		if parsed, parseErr := strconv.ParseInt(explicit, 10, 64); parseErr == nil && parsed > 0 {
+			// A numeric --invocation is an explicit provider run ID.
+			runID = parsed
+		} else {
+			id := invocation.InvocationID(explicit)
+			if err := invocation.ValidateInvocationID(id); err != nil {
+				return fmt.Errorf("invalid invocation ID %q: %w", explicit, err)
+			}
+			if !strings.HasPrefix(explicit, name+"/") {
+				return fmt.Errorf("invocation %q does not belong to function %q", explicit, name)
+			}
+			// Keep a synthetic record when no state backend is configured so
+			// provider-exposed invocation metadata can still resolve this
+			// explicit target. Without metadata, strict resolution below
+			// correctly refuses to guess.
+			logical = &invocation.Invocation{Function: name, ID: id}
+			if store != nil {
+				record, getErr := store.Get(ctx, name, id)
+				if getErr != nil {
+					if !errors.Is(getErr, invocation.ErrNotFound) {
+						return getErr
+					}
+					return fmt.Errorf("invocation %q not found for %s", explicit, name)
+				}
+				if record == nil {
+					return fmt.Errorf("invocation %q not found for %s", explicit, name)
+				}
+				logical = record
+			}
+			runID = logical.WorkflowRunID
+		}
+	} else if store != nil {
+		records, listErr := store.List(ctx, name, 0)
+		if listErr != nil {
+			return fmt.Errorf("list invocations for %s: %w", name, listErr)
+		}
+		if latest, ok := latestInvocation(records); ok {
+			logical = &latest
+			runID = latest.WorkflowRunID
+		}
+	}
+
 	client, err := r.client()
 	if err != nil {
 		return err
 	}
-	var runID int64
-	if *invocation != "" {
-		if parsed, parseErr := strconv.ParseInt(*invocation, 10, 64); parseErr == nil && parsed > 0 {
-			runID = parsed
-		} else {
-			runs, listErr := client.ListWorkflowRuns(ctx, r.services.WorkflowFor(name), 100)
-			if listErr != nil {
-				return listErr
-			}
-			if len(runs) == 0 {
-				return fmt.Errorf("no workflow runs for %s", name)
-			}
-			found := false
-			for _, run := range runs {
-				if run.Name == *invocation || run.Workflow == *invocation {
-					runID = run.ID
-					found = true
-					break
-				}
-			}
-			if !found {
-				return fmt.Errorf("invocation %q not found for %s", *invocation, name)
-			}
-		}
-	} else {
-		runs, listErr := client.ListWorkflowRuns(ctx, r.services.WorkflowFor(name), 1)
+	if runID == 0 {
+		runs, listErr := client.ListWorkflowRuns(ctx, r.services.WorkflowFor(name), 100)
 		if listErr != nil {
 			return listErr
 		}
-		if len(runs) == 0 {
-			return fmt.Errorf("no workflow runs for %s", name)
+		if explicit != "" {
+			// An explicit logical ID is a strict target. The provider API does
+			// not offer a universal input lookup, so only persisted run IDs or
+			// provider-exposed metadata may establish this association.
+			if logical == nil {
+				return fmt.Errorf("invocation %q has no associated workflow run", explicit)
+			}
+			run, ok := workflowRunForInvocation(*logical, runs, true)
+			if !ok || run.ID <= 0 {
+				return fmt.Errorf("invocation %q has no associated workflow run", explicit)
+			}
+			runID = run.ID
+		} else {
+			if len(runs) == 0 {
+				if logical != nil {
+					return fmt.Errorf("invocation %s has no workflow run", logical.ID)
+				}
+				return fmt.Errorf("no workflow runs for %s", name)
+			}
+			if logical != nil {
+				if run, ok := workflowRunForInvocation(*logical, runs, false); ok {
+					runID = run.ID
+				}
+			}
+			if runID == 0 {
+				latest := runs[0]
+				for _, run := range runs[1:] {
+					if run.CreatedAt.After(latest.CreatedAt) ||
+						(run.CreatedAt.Equal(latest.CreatedAt) && run.ID > latest.ID) {
+						latest = run
+					}
+				}
+				runID = latest.ID
+			}
 		}
-		runID = runs[0].ID
+	}
+	if runID <= 0 {
+		if logical != nil {
+			return fmt.Errorf("invocation %s has no workflow run", logical.ID)
+		}
+		return fmt.Errorf("no workflow run for %s", name)
 	}
 	reader, err := client.GetWorkflowLogs(ctx, runID)
 	if err != nil {

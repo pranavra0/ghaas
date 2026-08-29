@@ -30,3 +30,55 @@ func TestClientWorkflowLogs(t *testing.T) {
 		t.Fatalf("logs = %q, err = %v", data, err)
 	}
 }
+
+func TestClientWorkflowLogsFollowsRedirectWithoutLeakingToken(t *testing.T) {
+	var gotAuthorization string
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuthorization = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte("redirected logs\n"))
+	}))
+	defer final.Close()
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", final.URL+"/signed?token=example")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer api.Close()
+
+	client, err := NewClient(api.URL, "octo", "repo", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.HTTPClient = &http.Client{
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	body, err := client.GetWorkflowLogs(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	data, err := io.ReadAll(body)
+	if err != nil || string(data) != "redirected logs\n" {
+		t.Fatalf("logs = %q, err = %v", data, err)
+	}
+	if gotAuthorization != "" {
+		t.Fatalf("authorization leaked to signed log URL: %q", gotAuthorization)
+	}
+}
+
+func TestClientWorkflowLogsRejectsOversizedResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "67108865")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "octo", "repo", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetWorkflowLogs(context.Background(), 42); err == nil {
+		t.Fatal("GetWorkflowLogs unexpectedly accepted oversized response")
+	}
+}

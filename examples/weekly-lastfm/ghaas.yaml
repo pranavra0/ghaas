@@ -1,0 +1,24 @@
+version: 1
+
+defaults:
+  timeout: 15m
+
+functions:
+  weekly-lastfm:
+    runtime: command
+    command:
+      - bash
+      - examples/weekly-lastfm/weekly-lastfm.sh
+    env:
+      LASTFM_USERNAME: "replace-with-your-lastfm-username"
+    secrets:
+      - LASTFM_API_KEY
+      - DISCORD_WEBHOOK_URL
+    concurrency:
+      max: 1
+    schedule:
+      # GitHub supports an IANA timezone on schedule entries. The provider may
+      # still delay or drop runs; keep the UTC-adjusted cron if compatibility
+      # with older Actions behavior is required.
+      cron: "15 14 * * 5"
+      timezone: America/New_York
