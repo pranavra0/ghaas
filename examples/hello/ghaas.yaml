@@ -1,0 +1,17 @@
+version: 1
+
+defaults:
+  timeout: 2m
+
+functions:
+  hello:
+    runtime: command
+    command:
+      - bash
+      - examples/hello/hello.sh
+    env:
+      GREETING: "hello from ghaas"
+    schedule:
+      # GitHub Actions evaluates this cron in UTC.
+      cron: "0 9 * * *"
+      timezone: UTC

@@ -58,18 +58,77 @@ type Client struct {
 	Repository Repository
 }
 
+// MaxWorkflowLogBytes bounds both downloaded and expanded workflow logs.
+// GitHub normally returns a small zip archive, but a malicious or broken
+// endpoint must not be able to make the CLI allocate unbounded memory.
+const MaxWorkflowLogBytes int64 = 64 << 20
+
+const maxLogRedirects = 5
+
+// Issue is the subset of a GitHub issue returned by CreateIssue.
+type Issue struct {
+	Number  int64  `json:"number"`
+	Title   string `json:"title,omitempty"`
+	Body    string `json:"body,omitempty"`
+	State   string `json:"state,omitempty"`
+	HTMLURL string `json:"html_url,omitempty"`
+}
+
+// IssueCreator is implemented by clients that support dead-letter issues.
+// It is intentionally separate from GitHub so existing lightweight fakes do
+// not need to implement optional functionality.
+type IssueCreator interface {
+	CreateIssue(ctx context.Context, title, body string) (Issue, error)
+}
+
+// GitHubWithIssues combines the required Actions API with optional issue
+// creation for callers that need dead-letter notifications.
+type GitHubWithIssues interface {
+	GitHub
+	IssueCreator
+}
+
+// RepositoryFile is a file in a repository's contents API. SHA can be passed
+// back to PutRepositoryFile for optimistic concurrency.
+type RepositoryFile struct {
+	Path    string
+	SHA     string
+	Content []byte
+}
+
+// StateBranch is the optional branch-backed state API implemented by Client.
+// It is separate from GitHub because state support is not needed by all
+// callers and should not burden their fakes.
+type StateBranch interface {
+	GetStateFile(ctx context.Context, path string) (RepositoryFile, error)
+	PutStateFile(ctx context.Context, path, message string, content []byte, sha string) (RepositoryFile, error)
+}
+
+// StateBranchName is the conventional branch used by the optional state
+// helpers. Callers can use GetRepositoryFile/PutRepositoryFile for another
+// branch.
+const StateBranchName = "ghaas-state"
+
 // NewClient creates a client for owner/name. baseURL is normally
 // https://api.github.com; it is injectable for httptest servers.
 func NewClient(baseURL, owner, name, token string) (*Client, error) {
-	if owner == "" || name == "" {
+	if !validRepositoryComponent(owner) || !validRepositoryComponent(name) {
 		return nil, errors.New("github: owner and repository are required")
 	}
 	if baseURL == "" {
 		baseURL = "https://api.github.com"
 	}
-	u, err := url.Parse(strings.TrimRight(baseURL, "/") + "/")
-	if err != nil || u.Scheme == "" || u.Host == "" {
+	u, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || u.Scheme == "" || u.Host == "" ||
+		(u.Scheme != "http" && u.Scheme != "https") ||
+		u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("github: invalid base URL %q", baseURL)
+	}
+	if !strings.HasSuffix(u.Path, "/") {
+		u.Path += "/"
+		if u.RawPath != "" {
+			u.RawPath += "/"
+		}
 	}
 	return &Client{BaseURL: u, HTTPClient: http.DefaultClient, Token: token, Repository: Repository{Owner: owner, Name: name}}, nil
 }
@@ -107,48 +166,69 @@ func (c *Client) httpClient() *http.Client {
 
 func (c *Client) endpoint(parts ...string) string {
 	u := *c.BaseURL
-	segments := make([]string, 0, len(parts)+1)
-	for _, p := range parts {
-		segments = append(segments, pathEscapeSegments(p)...)
+	decodedBase := strings.TrimSuffix(u.Path, "/")
+	escapedBase := strings.TrimSuffix(u.EscapedPath(), "/")
+	decoded := make([]string, 0, len(parts))
+	escaped := make([]string, 0, len(parts))
+	for _, part := range parts {
+		decoded = append(decoded, part)
+		escaped = append(escaped, url.PathEscape(part))
 	}
-	u.Path = strings.TrimSuffix(u.Path, "/") + "/" + strings.Join(segments, "/")
-	u.RawPath = ""
+	u.Path = decodedBase + "/" + strings.Join(decoded, "/")
+	u.RawPath = escapedBase + "/" + strings.Join(escaped, "/")
 	return u.String()
 }
 
-func pathEscapeSegments(s string) []string {
-	// URL.Path stores decoded path text; URL.String performs the escaping.
-	// Storing PathEscape output here would escape percent signs a second time.
-	return []string{s}
+func (c *Client) request(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
+	resp, err := c.do(ctx, method, endpoint, body, true)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, c.responseError(method, endpoint, resp)
+	}
+	return resp, nil
 }
 
-func (c *Client) request(ctx context.Context, method, endpoint string, body io.Reader) (*http.Response, error) {
+func (c *Client) do(ctx context.Context, method, endpoint string, body io.Reader, authorize bool) (*http.Response, error) {
+	return c.doWithHTTPClient(c.httpClient(), ctx, method, endpoint, body, authorize)
+}
+
+func (c *Client) doWithHTTPClient(client *http.Client, ctx context.Context, method, endpoint string, body io.Reader, authorize bool) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "ghaas")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	if c.Token != "" {
+	if authorize && c.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.Token)
 	}
-	resp, err := c.httpClient().Do(req)
+	return client.Do(req)
+}
+
+func (c *Client) responseError(method, endpoint string, resp *http.Response) error {
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	message := strings.TrimSpace(string(data))
+	if message == "" {
+		message = resp.Status
+	}
+	return fmt.Errorf("github: %s %s: %s", method, redactURL(endpoint), message)
+}
+
+func redactURL(endpoint string) string {
+	u, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, err
+		return endpoint
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
-		message := strings.TrimSpace(string(data))
-		if message == "" {
-			message = resp.Status
-		}
-		return nil, fmt.Errorf("github: %s %s: %s", method, endpoint, message)
-	}
-	return resp, nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // DispatchWorkflow triggers workflow_dispatch for ref (usually the default
@@ -172,7 +252,11 @@ func (c *Client) DispatchWorkflow(ctx context.Context, workflow, ref string, inp
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	// A successful dispatch normally has no body. Drain a small response body
+	// anyway so keep-alive connections can be reused with test doubles and
+	// GitHub-compatible servers that return one.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
+	_ = resp.Body.Close()
 	return nil
 }
 
@@ -211,40 +295,125 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, workflow string, limit in
 	return result.Runs, nil
 }
 
-// GetWorkflowLogs returns the response body from the Actions logs endpoint.
-// GitHub's endpoint commonly returns a zip archive; callers may pass the
-// stream to ReadLogs, which extracts a useful text stream when applicable.
+// GetWorkflowLogs returns a bounded response body from the Actions logs
+// endpoint. GitHub commonly responds with a redirect to a short-lived signed
+// URL; redirects are followed even when a caller's HTTP client disables its
+// own redirect handling.
 func (c *Client) GetWorkflowLogs(ctx context.Context, runID int64) (io.ReadCloser, error) {
 	if runID <= 0 {
 		return nil, errors.New("github: run ID must be positive")
 	}
-	resp, err := c.request(ctx, http.MethodGet, c.endpoint("repos", c.Repository.Owner, c.Repository.Name, "actions", "runs", strconv.FormatInt(runID, 10), "logs"), nil)
+	endpoint := c.endpoint("repos", c.Repository.Owner, c.Repository.Name, "actions", "runs", strconv.FormatInt(runID, 10), "logs")
+	resp, err := c.getLogsResponse(ctx, endpoint)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Body, nil
+	if resp.ContentLength > MaxWorkflowLogBytes {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("workflow logs exceed %d bytes", MaxWorkflowLogBytes)
+	}
+	return &boundedReadCloser{ReadCloser: resp.Body, remaining: MaxWorkflowLogBytes}, nil
+}
+
+func (c *Client) getLogsResponse(ctx context.Context, endpoint string) (*http.Response, error) {
+	current := endpoint
+	client := *c.httpClient()
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	for redirects := 0; ; redirects++ {
+		resp, err := c.doWithHTTPClient(&client, ctx, http.MethodGet, current, nil, c.sameOrigin(current))
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return resp, nil
+		}
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			return nil, c.responseError(http.MethodGet, current, resp)
+		}
+		if redirects >= maxLogRedirects {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("github: too many redirects while fetching workflow logs")
+		}
+		location := strings.TrimSpace(resp.Header.Get("Location"))
+		_ = resp.Body.Close()
+		if location == "" {
+			return nil, errors.New("github: workflow logs redirect has no location")
+		}
+		next, err := url.Parse(location)
+		if err != nil {
+			return nil, fmt.Errorf("github: invalid workflow logs redirect: %w", err)
+		}
+		base, _ := url.Parse(current)
+		next = base.ResolveReference(next)
+		if (next.Scheme != "http" && next.Scheme != "https") || next.Host == "" {
+			return nil, fmt.Errorf("github: invalid workflow logs redirect URL %q", redactURL(next.String()))
+		}
+		current = next.String()
+	}
+}
+
+func (c *Client) sameOrigin(endpoint string) bool {
+	target, err := url.Parse(endpoint)
+	if err != nil || c.BaseURL == nil {
+		return false
+	}
+	return strings.EqualFold(target.Scheme, c.BaseURL.Scheme) &&
+		strings.EqualFold(target.Host, c.BaseURL.Host)
+}
+
+type boundedReadCloser struct {
+	io.ReadCloser
+	remaining int64
+	exceeded  bool
+}
+
+func (r *boundedReadCloser) Read(p []byte) (int, error) {
+	if r.exceeded {
+		return 0, fmt.Errorf("workflow logs exceed %d bytes", MaxWorkflowLogBytes)
+	}
+	if r.remaining > 0 {
+		if int64(len(p)) > r.remaining {
+			p = p[:r.remaining]
+		}
+		n, err := r.ReadCloser.Read(p)
+		r.remaining -= int64(n)
+		return n, err
+	}
+	// Probe one byte after the limit. Returning EOF here would silently
+	// truncate a chunked response, so report an explicit size error instead.
+	var probe [1]byte
+	n, err := r.ReadCloser.Read(probe[:])
+	if n > 0 {
+		r.exceeded = true
+		return 0, fmt.Errorf("workflow logs exceed %d bytes", MaxWorkflowLogBytes)
+	}
+	return 0, err
 }
 
 // ReadLogs writes an Actions log response to dst. The API returns a zip in
 // production, while test doubles and GitHub-compatible servers may return
 // plain text; support both without requiring callers to know the transport.
 func ReadLogs(dst io.Writer, src io.Reader) error {
-	const maxLogBytes int64 = 64 << 20
-	data, readErr := io.ReadAll(io.LimitReader(src, maxLogBytes+1))
+	data, readErr := io.ReadAll(io.LimitReader(src, MaxWorkflowLogBytes+1))
 	if readErr != nil {
 		return fmt.Errorf("read workflow logs: %w", readErr)
 	}
-	if int64(len(data)) > maxLogBytes {
-		return fmt.Errorf("workflow logs exceed %d bytes", maxLogBytes)
+	if int64(len(data)) > MaxWorkflowLogBytes {
+		return fmt.Errorf("workflow logs exceed %d bytes", MaxWorkflowLogBytes)
 	}
 	if zr, zipErr := zip.NewReader(bytes.NewReader(data), int64(len(data))); zipErr == nil {
 		var written int64
 		for _, f := range zr.File {
+			if f.UncompressedSize64 > uint64(MaxWorkflowLogBytes-written) {
+				return fmt.Errorf("expanded workflow logs exceed %d bytes", MaxWorkflowLogBytes)
+			}
 			rc, openErr := f.Open()
 			if openErr != nil {
 				return openErr
 			}
-			n, copyErr := io.Copy(dst, io.LimitReader(rc, maxLogBytes-written+1))
+			n, copyErr := io.Copy(dst, io.LimitReader(rc, MaxWorkflowLogBytes-written+1))
 			closeErr := rc.Close()
 			if copyErr != nil {
 				return copyErr
@@ -253,13 +422,16 @@ func ReadLogs(dst io.Writer, src io.Reader) error {
 				return closeErr
 			}
 			written += n
-			if written > maxLogBytes {
-				return fmt.Errorf("expanded workflow logs exceed %d bytes", maxLogBytes)
+			if written > MaxWorkflowLogBytes {
+				return fmt.Errorf("expanded workflow logs exceed %d bytes", MaxWorkflowLogBytes)
 			}
 		}
 		return nil
 	}
-	_, writeErr := dst.Write(data)
+	n, writeErr := dst.Write(data)
+	if writeErr == nil && n != len(data) {
+		return io.ErrShortWrite
+	}
 	return writeErr
 }
 
@@ -282,10 +454,23 @@ func ParseRepository(value string) (Repository, error) {
 		return Repository{}, fmt.Errorf("github: repository must be owner/name, got %q", value)
 	}
 	owner, name := parts[0], strings.TrimSuffix(parts[1], ".git")
-	if owner == "" || name == "" || strings.ContainsAny(owner, " \t\r\n") || strings.ContainsAny(name, " \t\r\n") {
+	if !validRepositoryComponent(owner) || !validRepositoryComponent(name) {
 		return Repository{}, fmt.Errorf("github: repository must be owner/name, got %q", value)
 	}
 	return Repository{Owner: owner, Name: name}, nil
+}
+
+func validRepositoryComponent(value string) bool {
+	if value == "" || value == "." || value == ".." ||
+		strings.ContainsAny(value, "/\\ \t\r\n:?#@%") {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // DiscoverRepositoryFromEnv is an explicit alias useful to callers that want
@@ -302,23 +487,31 @@ func discoverGitRemote() (Repository, error) {
 	if remote == "" {
 		return Repository{}, errors.New("github: git remote origin is empty")
 	}
-	if strings.HasPrefix(remote, "git@") {
-		if at := strings.IndexByte(remote, '@'); at >= 0 {
-			hostPath := remote[at+1:]
-			if colon := strings.IndexByte(hostPath, ':'); colon >= 0 {
-				if host := hostPath[:colon]; host != "github.com" && host != "www.github.com" {
-					return Repository{}, fmt.Errorf("github: git remote host %q is not GitHub", host)
-				}
-				remote = hostPath[colon+1:]
-			}
+	if strings.HasPrefix(strings.ToLower(remote), "git@") {
+		at := strings.IndexByte(remote, '@')
+		hostPath := remote[at+1:]
+		colon := strings.IndexByte(hostPath, ':')
+		if colon <= 0 {
+			return Repository{}, fmt.Errorf("github: unsupported git remote %q", remote)
 		}
-	} else if u, parseErr := url.Parse(remote); parseErr == nil && u.Host != "" {
-		if u.Host != "github.com" && u.Host != "www.github.com" {
+		host := strings.ToLower(hostPath[:colon])
+		if host != "github.com" && host != "www.github.com" {
+			return Repository{}, fmt.Errorf("github: git remote host %q is not GitHub", hostPath[:colon])
+		}
+		remote = hostPath[colon+1:]
+	} else {
+		u, parseErr := url.Parse(remote)
+		if parseErr != nil || u.Host == "" {
+			return Repository{}, fmt.Errorf("github: unsupported git remote %q", remote)
+		}
+		host := strings.ToLower(u.Hostname())
+		if host != "github.com" && host != "www.github.com" {
 			return Repository{}, fmt.Errorf("github: git remote host %q is not GitHub", u.Host)
 		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			return Repository{}, fmt.Errorf("github: unsupported git remote %q", remote)
+		}
 		remote = strings.TrimPrefix(u.Path, "/")
-	} else {
-		return Repository{}, fmt.Errorf("github: unsupported git remote %q", remote)
 	}
 	return parseRepository(remote)
 }

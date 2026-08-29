@@ -31,6 +31,7 @@ func Parse(data []byte) (manifest.Manifest, error) {
 	}
 	return m, nil
 }
+
 // ParseFile reads, parses, and validates a manifest file.
 func ParseFile(path string) (manifest.Manifest, error) { return Load(path) }
 

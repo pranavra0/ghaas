@@ -45,6 +45,24 @@ func TestClientDispatchAndRuns(t *testing.T) {
 	}
 
 }
+
+func TestClientEscapesEndpointSegments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		want := "/repos/octo/repo/actions/workflows/ghaas%2Ftest.yml/dispatches"
+		if r.URL.EscapedPath() != want {
+			t.Errorf("escaped path = %q, want %q", r.URL.EscapedPath(), want)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "octo", "repo", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DispatchWorkflow(context.Background(), "ghaas/test.yml", "main", nil); err != nil {
+		t.Fatal(err)
+	}
+}
 func TestReadLogsPlainAndZip(t *testing.T) {
 	var plain bytes.Buffer
 	if err := ReadLogs(&plain, bytes.NewBufferString("hello\n")); err != nil || plain.String() != "hello\n" {
