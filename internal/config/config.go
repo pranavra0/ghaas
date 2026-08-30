@@ -6,13 +6,8 @@ import (
 	"io"
 	"os"
 
-	"ghaas/pkg/manifest"
+	"github.com/pranavra0/ghaas/pkg/manifest"
 )
-
-// Config is an alias for the public manifest representation.
-// It is provided so callers can refer to configuration without importing the
-// implementation package used by the loader.
-type Config = manifest.Manifest
 
 // Decode parses a manifest without applying semantic validation. YAML decoding
 // remains strict: unknown fields and multiple documents are rejected.
@@ -31,9 +26,6 @@ func Parse(data []byte) (manifest.Manifest, error) {
 	}
 	return m, nil
 }
-
-// ParseFile reads, parses, and validates a manifest file.
-func ParseFile(path string) (manifest.Manifest, error) { return Load(path) }
 
 // LoadReader parses and validates a manifest from an already-open reader.
 func LoadReader(r io.Reader) (manifest.Manifest, error) {
@@ -63,6 +55,3 @@ func Load(path string) (manifest.Manifest, error) {
 	}
 	return m, nil
 }
-
-// LoadFile is an explicit alias for Load.
-func LoadFile(path string) (manifest.Manifest, error) { return Load(path) }

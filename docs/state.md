@@ -1,134 +1,77 @@
-# Invocation state
+# State boundary
 
-State is the coordination record behind a logical invocation. It is separate from
-GitHub's workflow-run record: one invocation may be attempted by more than one run,
-and a workflow run may end before it creates or updates state.
+## v0.1 is stateless
 
-## Record format
+The generated workflow does not maintain a ghaas invocation store. `ghaas runtime invoke`
+loads and validates `ghaas.yaml`, exports invocation metadata, runs one command, and
+returns its process result. It does not create state records, acquire leases, retry a
+failed command, write a branch, commit files, or call an issue API.
 
-A record has this shape (pointer fields are omitted when unset):
+The runner workspace is ephemeral from ghaas's point of view. A `.ghaas-state` directory,
+a branch-shaped folder, or a local file created by a command is not a ghaas backend and is
+not durable across hosted runners. Examples do not imply local or remote branch
+persistence.
 
-```json
-{
-  "schema_version": 1,
-  "function": "weekly-lastfm",
-  "invocation_id": "weekly-lastfm/2026-08-28",
-  "status": "succeeded",
-  "attempts": 2,
-  "created_at": "2026-08-28T13:15:00Z",
-  "started_at": "2026-08-28T13:20:02Z",
-  "completed_at": "2026-08-28T13:20:10Z",
-  "workflow_run_id": 123456789,
-  "trigger": "schedule",
-  "result": { "exit_code": 0 }
-}
-```
+## Workflow-run view
 
-A running record may also contain an advisory lease:
+`status` and `logs` query GitHub's workflow-run API. A run can fail before the command
+starts, and a command can affect an external service before its run result is observed.
+Consequently a provider result is an execution observation, not a transactional business
+record.
 
-```json
-"lease": {
-  "owner": "workflow-run-123",
-  "expires_at": "2026-08-28T13:40:00Z"
-}
-```
-
-Fields:
-
-- `schema_version` is `1` for records written by the current stores.
-- `function` and `invocation_id` identify the record. IDs must belong to the function
-  and use the path-safe canonical form described in [semantics](semantics.md).
-- `status` is one of `pending`, `running`, `succeeded`, `failed`, or `exhausted`.
-- `attempts` increments when a runner claims an attempt, including recovered attempts.
-- Timestamps are UTC. `created_at` is set at creation; `started_at` and `completed_at`
-  describe lifecycle transitions.
-- `workflow_run_id` and `trigger` correlate state with GitHub when available.
-- `lease` identifies the current owner and expiration. An expired lease may be recovered.
-- `result` stores the exit code and, for an execution error, its error text. Command
-  output is not stored in state; use GitHub Actions logs.
-
-Secrets and complete process environments MUST NOT be written to this record.
-
-## Store contract
-
-Backends implement four operations:
-
-```go
-type Store interface {
-    Get(ctx context.Context, function string, id InvocationID) (*Invocation, error)
-    Create(ctx context.Context, invocation Invocation) error
-    CompareAndSwap(ctx context.Context, previous Invocation, next Invocation) error
-    List(ctx context.Context, function string, limit int) ([]Invocation, error)
-}
-```
-
-`Get` returns `ErrNotFound` when absent. `Create` rejects duplicate keys with a
-conflict. `CompareAndSwap` updates only if the stored record still equals `previous`;
-otherwise it returns `ErrConflict`. Callers must reread after a conflict, not overwrite
-the newer record. `List` is scoped to a function when one is provided; a positive limit
-truncates the result and zero means no limit.
-
-Stores validate schema, function/ID ownership, status, timestamps, and lifecycle
-invariants. They copy records crossing the API boundary so callers cannot mutate stored
-pointers by accident. Malformed records and path/identity mismatches fail closed.
-
-The record transition helpers enforce these edges:
+The provider-neutral workflow-run model includes fields such as:
 
 ```text
-pending -> running
-running -> succeeded | failed
-failed  -> pending | exhausted
+ID
+Name
+DisplayTitle
+Workflow
+Status
+Conclusion
+CreatedAt / StartedAt / UpdatedAt
 ```
 
-A retrying runtime uses the `failed -> pending` edge before its next attempt. A runtime
-with no retry policy leaves the failed record in `failed`.
+Generated workflows set `Name` to `ghaas: <function>` and set the run-name expression
+exactly to:
 
-## Runtime algorithm
+```yaml
+run-name: 'ghaas: <function>/${{ inputs.ghaas_invocation_id || github.run_id }}'
+```
 
-For one `runtime.Invoke` call:
+GitHub exposes that value as `display_title`, represented by `DisplayTitle`. When a
+caller asks for an explicit logical ID, matching must use that title exactly. It must not
+fall back to timing, run order, or the newest workflow. A dispatch without `--ref` uses
+the target repository's default branch; an explicit ref overrides it.
 
-1. Read the record, creating `pending` if it does not exist.
-2. Return a terminal record unchanged.
-3. Refuse an active lease (or a running record with no recoverable lease) as busy.
-4. CAS `pending` to `running`, incrementing `attempts`; when leases are enabled, record
-   the owner and finite expiry. An expired running lease may be recovered through CAS.
-5. Execute the argv command with the caller's context and invocation environment.
-6. CAS the running record to `succeeded` for exit code 0, or `failed` otherwise, clearing
-   the lease.
-7. If `retry.max_attempts` permits another attempt, CAS `failed` to `pending`, wait for
-   `retry.backoff`, and repeat. Otherwise transition `failed` to `exhausted`.
+A run's status may be `queued`, `in_progress`, or `completed` with a conclusion such as
+`success`, `failure`, `cancelled`, or `timed_out`. GitHub can delay API visibility,
+redact/expire logs, or cancel a run. None of these fields records a durable command
+outcome or rolls back an external side effect.
 
-Completion and retry state writes use a context without cancellation where possible, so
-a command timeout does not automatically prevent recording the failed attempt. A CAS
-conflict is returned or causes a reread at the claim boundary; it is never silently
-merged. A lease limits concurrent claims but cannot undo an external effect made before
-a process crash.
+Manual dispatches carry a function-scoped `<function>/<canonical UUID>` logical ID, with
+the UUID passed as the workflow input. A scheduled run has no dispatch input and uses the
+provider workflow run ID fallback. The runtime exports that input or fallback as
+`GHAAS_INVOCATION_ID`; it is useful for tracing and for a destination idempotency key,
+but it is not a stored claim and does not establish exactly-once execution.
 
-## Current backends and durability boundary
+The generated run name is a correlation aid. More than one workflow run can exist for an
+opportunity, and a workflow run may exist without a matching durable invocation record.
+Callers that need business completion must query the destination system or maintain an
+application-owned record.
 
-The repository provides:
+## Deferred state work
 
-- `state.Memory`, a mutex-protected process-local store; and
-- `state.BranchStore`, a branch-shaped file store with atomic optimistic updates.
+The following are explicitly roadmap features, not v0.1 behavior:
 
-The CLI's explicit `state.backend: memory` choice creates process-local state. The default
-branch backend writes JSON below `.ghaas-state/<branch>` in the current checkout, using a
-branch namespace and a `functions/<function>/` subtree (the branch defaults to
-`ghaas-state`). It validates path components and protects concurrent writers within one
-process, but does **not** commit or push those files to a GitHub branch. Independent
-processes/runners require a remote Store implementation for cross-process coordination.
-The Store interface lets an embedding application provide that implementation.
+- a typed invocation record and durable `Get`/create/compare-and-swap store;
+- persistent state shared by independent runners or repositories;
+- retry and backoff scheduling, attempt history, or dead-letter/exhaustion handling;
+- leases and recovery for abandoned running work;
+- remote Git branch persistence with protected refs and conflict handling;
+- execution windows, SLO declarations, and catch-up scheduling; and
+- APIs that infer business completion from workflow state.
 
-Do not infer GitHub durability from the `branch` name or from the workflow's `contents:
-write` permission. A remote branch integration must explicitly read the branch, perform
-an optimistic update, and push a new commit/ref; that integration is outside the stock
-CLI runtime.
-
-## Leases and recovery
-
-The runtime's generated entrypoint sets the lease TTL to the effective function timeout.
-A live lease blocks another owner. After expiration, another runner may CAS-acquire a
-new lease and execute a recovery attempt. Recovery is useful for abandoned `running`
-records, but lease expiry is not evidence that the first runner stopped: a partitioned or
-slow runner can still produce an external effect. Use destination idempotency keys and
-keep lease durations appropriate for the command.
+Until those features are designed and implemented, do not infer durability from a branch
+name, a workflow permission, a run ID, or the presence of `GHAAS_INVOCATION_ID`. If an
+application needs durable coordination today, it must own that store and its idempotency
+policy outside the generated ghaas workflow.

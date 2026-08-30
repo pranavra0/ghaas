@@ -1,7 +1,7 @@
 package config
 
 import (
-	"ghaas/pkg/manifest"
+	"github.com/pranavra0/ghaas/pkg/manifest"
 	"strings"
 	"testing"
 	"time"
@@ -9,7 +9,8 @@ import (
 
 func validManifest() manifest.Manifest {
 	return manifest.Manifest{
-		Version: 1,
+		Version:  1,
+		Defaults: manifest.Defaults{Timeout: manifest.Duration(15 * time.Minute)},
 		Functions: map[string]manifest.Function{
 			"hello": {
 				Runtime: manifest.RuntimeCommand,
@@ -66,63 +67,53 @@ func TestValidateReportsDeterministicContextualErrors(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsUnsupportedStateAndRetry(t *testing.T) {
+func TestValidateRejectsReservedMetadataAndSecretsCollision(t *testing.T) {
 	m := validManifest()
 	m.Functions["hello"] = manifest.Function{
 		Runtime: manifest.RuntimeCommand,
 		Command: []string{"echo"},
-		State:   &manifest.StateConfig{},
-		Retry:   &manifest.RetryConfig{},
-	}
-	if err := Validate(m); err == nil || !strings.Contains(err.Error(), "not supported") {
-		t.Fatalf("Validate() error = %v, want unsupported state/retry", err)
-	}
-}
-func TestValidateAcceptsStateRetryWindowAndSLO(t *testing.T) {
-	m := validManifest()
-	m.Functions["hello"] = manifest.Function{
-		Runtime: manifest.RuntimeCommand,
-		Command: []string{"echo", "hello"},
-		Schedule: &manifest.ScheduleConfig{
-			Cron:     "15 9 * * 5",
-			Timezone: "America/New_York",
-			ExecutionWindow: &manifest.ExecutionWindow{
-				Start: "09:15",
-				End:   "19:00",
-			},
+		Environment: map[string]string{
+			"GHAAS_FUNCTION":          "shadow",
+			"GHAAS_SCHEDULE_TIMEZONE": "shadow",
 		},
-		State:       &manifest.StateConfig{Backend: manifest.StateBackendBranch},
-		Retry:       &manifest.RetryConfig{MaxAttempts: 4, Backoff: manifest.Duration(5 * time.Minute)},
-		OnExhausted: &manifest.OnExhaustedConfig{Issue: true},
-		SLO:         &manifest.SLOConfig{SuccessRate: 99.9, ScheduleDelay: manifest.Duration(15 * time.Minute)},
+		Secrets: []string{"TOKEN", "TOKEN", "VALUE"},
 	}
-	if err := Validate(m); err != nil {
-		t.Fatalf("Validate() error = %v", err)
+	m.Functions["hello"].Environment["VALUE"] = "ordinary"
+	err := Validate(m)
+	if err == nil {
+		t.Fatal("Validate() succeeded, want reserved/collision errors")
+	}
+	for _, fragment := range []string{"GHAAS_FUNCTION", "GHAAS_SCHEDULE_TIMEZONE", "duplicated", "collides"} {
+		if !strings.Contains(err.Error(), fragment) {
+			t.Errorf("error %q does not contain %q", err, fragment)
+		}
 	}
 }
 
-func TestValidateRejectsInvalidReliabilityConfig(t *testing.T) {
+func TestValidateRejectsFutureFieldsAtDecode(t *testing.T) {
+	for _, field := range []string{"state", "retry", "target", "execution_window", "on_exhausted", "slo"} {
+		data := "version: 1\nfunctions:\n  hello:\n    runtime: command\n    command: [echo]\n    " + field + ": {}\n"
+		if _, err := Parse([]byte(data)); err == nil {
+			t.Errorf("Parse accepted future field %q", field)
+		}
+	}
+}
+
+func TestValidateRejectsInvalidTimeoutScheduleAndConcurrency(t *testing.T) {
 	m := validManifest()
+	m.Defaults.Timeout = manifest.Duration(-time.Minute)
 	m.Functions["hello"] = manifest.Function{
-		Runtime: manifest.RuntimeCommand,
-		Command: []string{"echo"},
-		Schedule: &manifest.ScheduleConfig{
-			Cron:     "* * * * *",
-			Timezone: "UTC",
-			ExecutionWindow: &manifest.ExecutionWindow{
-				Start: "19:00",
-				End:   "09:15",
-			},
-		},
-		State: &manifest.StateConfig{Backend: "sqlite"},
-		Retry: &manifest.RetryConfig{MaxAttempts: 0},
-		SLO:   &manifest.SLOConfig{SuccessRate: 101},
+		Runtime:     manifest.RuntimeCommand,
+		Command:     []string{"echo"},
+		Timeout:     manifest.Duration(-time.Second),
+		Schedule:    &manifest.ScheduleConfig{Cron: "* * * *", Timezone: "No/Such_Zone"},
+		Concurrency: manifest.ConcurrencyConfig{Max: 2},
 	}
 	err := Validate(m)
 	if err == nil {
 		t.Fatal("Validate() succeeded, want semantic errors")
 	}
-	for _, fragment := range []string{"execution_window.end", "unsupported state backend", "max_attempts", "success_rate"} {
+	for _, fragment := range []string{"defaults.timeout", "timeout", "schedule.cron", "schedule.timezone", "concurrency.max"} {
 		if !strings.Contains(err.Error(), fragment) {
 			t.Errorf("error %q does not contain %q", err, fragment)
 		}
