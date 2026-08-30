@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Check gofmt
+        shell: bash
+        run: |
+          formatted="$(gofmt -l .)"
+          if [[ -n "$formatted" ]]; then
+            printf 'gofmt is stale for:\n%s\n' "$formatted"
+            exit 1
+          fi
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Build CLI
+        run: go build -trimpath -o "$RUNNER_TEMP/ghaas" ./cmd/ghaas
+
+      - name: Check go mod tidy cleanliness
+        shell: bash
+        run: |
+          go mod tidy
+          # Tidy is allowed to expose stale module files, never silently ignored.
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Check generation determinism and golden behavior
+        run: go test ./internal/compiler
+
+      - name: Smoke test CLI in a separate target-repository fixture
+        shell: bash
+        run: |
+          fixture="$RUNNER_TEMP/ghaas-target"
+          binary="$RUNNER_TEMP/ghaas"
+          rm -rf "$fixture"
+          mkdir -p "$fixture/examples/hello"
+          cp examples/hello/ghaas.yaml "$fixture/ghaas.yaml"
+          cp examples/hello/hello.sh "$fixture/examples/hello/hello.sh"
+          (
+            cd "$fixture"
+            "$binary" validate
+            "$binary" generate hello > "$RUNNER_TEMP/ghaas-generated-one.yml"
+            "$binary" generate hello > "$RUNNER_TEMP/ghaas-generated-two.yml"
+            cmp "$RUNNER_TEMP/ghaas-generated-one.yml" "$RUNNER_TEMP/ghaas-generated-two.yml"
+            "$binary" deploy --function hello
+            "$binary" deploy --check
+            printf '%s\n' '# stale generated workflow' > .github/workflows/ghaas-stale.yml
+            if "$binary" deploy --check; then
+              printf '%s\n' 'deploy --check accepted a stale generated workflow'
+              exit 1
+            fi
+            rm .github/workflows/ghaas-stale.yml
+            "$binary" deploy --check
+          )
+
+      - name: Install pinned actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Validate repository and generated workflows
+        shell: bash
+        run: |
+          # actionlint 1.7.7 predates GitHub's schedule.timezone key; the
+          # compiler tests parse and assert that provider extension separately.
+          "$(go env GOPATH)/bin/actionlint" -ignore 'element of "schedule" section must be mapping and must contain one key "cron"' .github/workflows/*.yml "$RUNNER_TEMP/ghaas-target"/.github/workflows/*.yml

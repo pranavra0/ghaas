@@ -1,155 +1,114 @@
 # Security model
 
-The primary security boundary is the GitHub repository. Anyone who can change the
-manifest, command, installer, or generated workflow can change what a function executes.
-Treat ghaas configuration as code, review it like code, and protect branches that contain
-it.
+The target repository is the primary trust boundary. Anyone who can change its manifest,
+command, dependencies, installer, or generated workflow can change what runs. Review
+those files as code and protect the branch that contains deployed workflows.
 
-## Trust assumptions
+`ghaas` is not a sandbox or multi-tenant runtime. The command has the normal GitHub
+Actions runner's process permissions and network access. A workflow can read files in its
+checkout and any credentials made available to it.
 
-The default design assumes:
+## Trust and injection controls
 
-- repository maintainers control function definitions, scripts, and generated workflows;
-- GitHub-hosted runners and the Actions service are the execution environment;
-- repository/environment secrets are trusted inputs;
-- the local state directory is trusted persistence only for the lifetime and access scope
-  of its checkout; and
-- dependencies fetched by the command and install step are acceptable.
+The v0.1 runtime executes `command` as an argv array. It does not join elements into a
+shell string or add shell parsing, quoting, globbing, or interpolation. If shell behavior
+is intended, make it explicit, such as `command: [sh, -c, ./script]`, and keep
+user-controlled values out of the script string.
 
-This is not a sandbox for untrusted tenants. A command runtime intentionally has the
-runner's normal process capabilities and network access.
+Manifest decoding is strict: unsupported fields, malformed values, invalid environment
+names, and multiple YAML documents are rejected. Validation is not authorization; a
+maintainer can still choose a command that exfiltrates data. Generated YAML is data from
+the compiler, not a safe place to splice untrusted text into a hand-written `run:` step.
+Do not edit generated files; change the manifest and regenerate them.
 
-## Threats and controls
+The generated installer is pinned to the reviewed canonical release:
 
-### Command and workflow injection
-
-`command` is an argv array. The runtime passes each element directly to the OS process
-API and does not join it into a shell string. This preserves argument boundaries and
-avoids accidental shell interpretation. Keep user-controlled data out of an explicit
-shell command. If shell behavior is necessary, make it visible, for example
-`["sh", "-c", "./script --fixed-flag"]`, and validate/quote all dynamic data inside
-that script.
-
-Generated workflow values are emitted as YAML data, not as a function command fragment.
-The function command is loaded from the checked-out manifest by `ghaas runtime invoke`.
-Do not hand-edit generated files to splice untrusted values into `run:`. `ghaas deploy`
-rejects unsafe generated paths and existing symlink path components when writing
-workflows; still review generated output before committing it.
-
-### Manifest, installer, and repository changes
-
-Manifest names, environment names, secret names, durations, cron, timezone, state,
-retry, and runtime are strictly validated. Validation is not authorization: a maintainer
-can still choose a command that exfiltrates data. Require pull requests/review for
-manifest, script, installer, and workflow changes, pin action versions where policy
-requires it, and use protected branches for deployed workflows.
-
-The default generated install step is
-`go install ./cmd/ghaas && echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"`,
-followed by `ghaas runtime invoke <function>`. The checked-out repository must contain
-the ghaas source and Go module (or use a reviewed installer override), the runner must
-have Go 1.23+, dependencies must be fetchable, and `GITHUB_PATH` must be supported.
-
-### Secret exposure
-
-A manifest `secrets` entry contains only a GitHub secret **name**. The generated workflow
-references `${{ secrets.NAME }}`; the value is supplied by GitHub at run time. ghaas does
-not validate the secret's existence locally, and state records never store secret values
-or a complete environment.
-
-The generated invocation environment also wires the run-scoped `${{ secrets.GITHUB_TOKEN }}`
-when the function does not already define `GITHUB_TOKEN`; this is separate from the
-developer's local token and is subject to the workflow `permissions` block.
-
-Do not:
-
-- put secret values in `ghaas.yaml`, command arguments, source, or generated YAML;
-- print the environment or request/response URLs containing credentials;
-- enable shell tracing (`set -x`) in a function that handles secrets;
-- include secrets in invocation IDs, issue bodies, state, or debug output; or
-- pass secrets to a function that does not need them.
-
-GitHub may mask a configured secret in logs, but masking is not a guarantee against
-transformation, truncation, subprocess leaks, or exfiltration. Treat logs as sensitive
-and grant only the people/apps that need to read them.
-
-### State and lease manipulation
-
-The memory backend is process-local. The built-in branch backend is a JSON file store
-under the checkout's `.ghaas-state/<branch>` namespace, with a
-`functions/<function>/` subtree; it uses validation, path namespacing, optimistic CAS,
-and atomic updates, but does not commit or push to a remote GitHub branch. A user or
-process with write access to that checkout can alter state. A remote Store supplied by an
-embedding application must protect its state branch, reject malformed records, and use
-optimistic ref updates rather than force-pushing stale data.
-
-Leases reduce concurrent execution but do not sandbox a command or roll back an external
-effect. A runner that retains a lease past a network partition may still act after another
-runner recovers the expired lease. Use external idempotency keys for side effects.
-
-### Logs and metadata
-
-Workflow logs are a data-exfiltration surface. Invocation state intentionally stores
-metadata (function, ID, attempt, timestamps, trigger, workflow run ID, lease, exit code,
-and error), not stdout/stderr or secrets. Avoid putting credentials in error strings.
-Apply the repository's log retention and access policy.
-
-## API token and workflow permissions
-
-Local API commands use `GITHUB_TOKEN` and discover the repository from
-`GITHUB_REPOSITORY=OWNER/NAME` or the Git `origin` remote. Set the token before commands
-that call GitHub:
-
-```bash
-export GITHUB_REPOSITORY=OWNER/NAME   # optional inside a Git checkout
-export GITHUB_TOKEN=...                # never commit or print this value
+```text
+go install github.com/pranavra0/ghaas/cmd/ghaas@v0.1.0
 ```
 
-A fine-grained token should be scoped to the target repository:
+The target repository need not contain ghaas source, but the installer and fetched
+modules are executable code. Review release changes, module updates, scripts, and action
+versions. A compromised dependency or changed release is inside the trust boundary.
 
-| Operation | Required repository permission |
+## Environment and secrets
+
+`env` contains literal values and `secrets` contains only GitHub secret names. Local
+validation cannot prove that a named secret exists. An environment name cannot occur in
+both collections, and `GHAAS_*` names are reserved for ghaas-owned metadata.
+
+The effective environment order is:
+
+1. ambient runner environment;
+2. manifest `env` values; then
+3. ghaas-owned `GHAAS_*` metadata.
+
+Secret values are supplied by GitHub at run time. Never put a secret value in the
+manifest, command arguments, source, generated YAML, invocation ID, or diagnostic text.
+Do not print the environment, enable `set -x`, or include credential-bearing URLs in
+logs. GitHub masking reduces accidental disclosure but does not prevent transformation,
+subprocess leaks, or exfiltration. Treat workflow logs as sensitive.
+
+The runtime exports `GHAAS_FUNCTION`, `GHAAS_INVOCATION_ID`, `GHAAS_ATTEMPT`,
+`GHAAS_TRIGGER`, and `GHAAS_WORKFLOW_RUN_ID`. An invocation ID is useful as an external
+idempotency key, not as a secret and not as proof of exactly-once effects.
+
+## Workflow permissions
+
+Generated workflows request only:
+
+```yaml
+permissions:
+  contents: read
+```
+
+Checkout needs that read permission. v0.1 has no state branch, issue notification, or
+other generated write operation. Review generated YAML and reject unexpected permission
+upgrades. The workflow's run-scoped `GITHUB_TOKEN` is separate from a developer's local
+`GITHUB_TOKEN`.
+
+Local API commands use the developer token. Scope it to the target repository and the
+operation:
+
+| Operation | Minimum repository permission |
 | --- | --- |
-| `validate`, `generate`, local `deploy` | none |
-| `invoke` (workflow dispatch) | Actions: write (GitHub may also require read) |
-| `status` (list runs) | Actions: read |
-| `logs` (download logs) | Actions: read |
-| local/remote state operations, if enabled by an embedding service | repository-specific contents access |
-| exhausted-invocation issue | Issues: write |
-| checkout in generated workflow | Contents: read |
+| `validate`, `generate`, local `deploy` | None |
+| `invoke` | Actions: write (and visibility/read as required by GitHub) |
+| `status`, `logs` | Actions: read |
+| generated checkout | Contents: read, on the run-scoped token |
 
-The token also needs ordinary repository visibility. A classic token generally needs
-`repo` for a private repository and corresponding Actions access. Organization policy,
-SSO, private-repository visibility, Actions policy, and fine-grained token approval can
-impose additional requirements. Keep local tokens out of shell history and CI logs.
-Prefer a short-lived token with only the repository and permissions needed for the
-operation.
+Set local discovery explicitly when needed, but never commit the token:
 
-The generated workflow receives a separate, run-scoped GitHub-provided `GITHUB_TOKEN`;
-it is not the local developer token. The compiler emits `contents: read` for checkout by
-default, upgrades to `contents: write` for the branch state backend, and adds
-`issues: write` when exhausted-issue handling is configured. Inspect generated YAML and
-reduce permissions when no corresponding operation is needed. A contents-write
-permission is not harmless merely because the default state backend is local.
+```bash
+export GITHUB_TOKEN=...
+export GITHUB_REPOSITORY=OWNER/REPOSITORY
+```
+
+Keep tokens out of shell history and CI output. Prefer short-lived, repository-scoped
+credentials. Organization policy, SSO, environment protection, and Actions policy can
+require additional approval.
 
 ## Operational checklist
 
-Before deployment:
+Before deploying a function:
 
-1. Review `ghaas generate` output, including the installer, `permissions`, and command.
-2. Run `ghaas validate` and `ghaas deploy --check` in CI.
-3. Protect the manifest, scripts, installer, and generated workflow paths with code review.
-4. Configure only the named repository secrets; verify they are available to the selected
-   branch/environment.
-5. Confirm local token scope: Actions write only when dispatching; Actions read for
-   queries; Issues write only when exhaustion notifications are required.
-6. Confirm workflow `permissions` is no broader than the operation requires.
-7. Test timeout, retry, lease recovery, and failure behavior without real irreversible
-   side effects.
-8. Make external operations idempotent with `GHAAS_INVOCATION_ID` where possible.
-9. Set an appropriate log-retention and access policy.
-10. Rotate tokens and secrets after suspected exposure.
+1. Run `ghaas validate` and review `ghaas generate` output.
+2. Run `ghaas deploy --check` in CI so generated files cannot drift.
+3. Require review for the manifest, scripts, dependencies, installer, and workflows.
+4. Configure only the named target-repository secrets and verify their environment scope.
+5. Confirm the local token has only the Actions access needed by the command.
+6. Confirm the generated workflow still has `contents: read` and no write permissions.
+7. Test timeout, cancellation, and failure paths without irreversible effects.
+8. Use `GHAAS_INVOCATION_ID` for destination idempotency where supported.
+9. Apply an appropriate workflow-log retention and access policy.
+10. Rotate credentials after suspected exposure.
 
-No permission setting can provide exactly-once external effects. A runner can crash
- after an API accepted a request but before ghaas records success; lease recovery or
-retry can repeat it. The destination must provide idempotency or the application must
-provide its own deduplication.
+No permission setting makes external effects exactly once. A runner can disappear after
+a destination accepts a request, and a rerun can repeat it. The destination or command
+must provide idempotency or deduplication.
+
+## Deferred work
+
+Durable state, retries, leases, remote branch persistence, execution windows, SLOs, and
+additional isolation are roadmap items. They are not hidden security guarantees or v0.1
+manifest fields.

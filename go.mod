@@ -1,4 +1,4 @@
-module ghaas
+module github.com/pranavra0/ghaas
 
 go 1.23
 

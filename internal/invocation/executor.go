@@ -9,14 +9,14 @@ import (
 	"os/exec"
 )
 
-// CommandRunner is the small seam used by Runtime and tests.
+// CommandRunner is the small seam used by callers and tests.
 type CommandRunner interface {
 	Run(context.Context, []string) (int, error)
 }
 
-// Runner executes a command directly (never through a shell). Nil streams use
-// the corresponding process-standard stream. Env, when non-nil, follows
-// os/exec semantics and replaces the inherited environment.
+// Runner executes a command directly, never through a shell. Nil streams use
+// the corresponding process-standard stream. Env, when non-nil, replaces the
+// inherited environment; RunWithEnvironment applies additional values over it.
 type Runner struct {
 	Stdin  io.Reader
 	Stdout io.Writer
@@ -24,18 +24,6 @@ type Runner struct {
 	Dir    string
 	Env    []string
 }
-
-// ExecRunner is an alternate name for Runner.
-type ExecRunner = Runner
-
-// NewRunner returns the production os/exec runner with standard streams.
-func NewRunner() Runner { return Runner{} }
-
-// Executor is an alternate name for Runner.
-type Executor = Runner
-
-// OSRunner is an explicit name for the production os/exec implementation.
-type OSRunner = Runner
 
 // Run executes args while preserving each argument boundary. On a normal
 // non-zero exit, the returned error is *exec.ExitError and code is the child
@@ -46,8 +34,8 @@ func (r Runner) Run(ctx context.Context, args []string) (int, error) {
 	return r.run(ctx, args, nil)
 }
 
-// RunWithEnvironment runs a command with invocation metadata merged into the
-// configured environment. It never invokes a shell and never mutates r.Env.
+// RunWithEnvironment runs a command with values merged into its environment.
+// It never invokes a shell and never mutates r.Env.
 func (r Runner) RunWithEnvironment(ctx context.Context, args []string, env map[string]string) (int, error) {
 	return r.run(ctx, args, env)
 }
@@ -80,10 +68,11 @@ func (r Runner) run(ctx context.Context, args []string, env map[string]string) (
 		cmd.Env = append([]string(nil), r.Env...)
 	}
 	if env != nil {
-		if cmd.Env == nil {
-			cmd.Env = os.Environ()
+		base := cmd.Env
+		if base == nil {
+			base = os.Environ()
 		}
-		cmd.Env = MergeEnvironment(cmd.Env, env)
+		cmd.Env = MergeEnvironment(base, env)
 	}
 
 	err := cmd.Run()
@@ -100,12 +89,7 @@ func (r Runner) run(ctx context.Context, args []string, env map[string]string) (
 	return -1, fmt.Errorf("start command: %w", err)
 }
 
-// Execute runs args with the process-standard streams.
+// Execute runs args with the process-standard streams and ambient environment.
 func Execute(ctx context.Context, args []string) (int, error) {
 	return (Runner{}).Run(ctx, args)
-}
-
-// RunCommand is a compatibility spelling for Execute.
-func RunCommand(ctx context.Context, args []string) (int, error) {
-	return Execute(ctx, args)
 }

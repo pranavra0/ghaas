@@ -1,3 +1,5 @@
+# This fixture is intended for a separate target repository. Keep the command
+# script at examples/weekly-lastfm/weekly-lastfm.sh after copying it.
 version: 1
 
 defaults:
@@ -17,8 +19,6 @@ functions:
     concurrency:
       max: 1
     schedule:
-      # GitHub supports an IANA timezone on schedule entries. The provider may
-      # still delay or drop runs; keep the UTC-adjusted cron if compatibility
-      # with older Actions behavior is required.
+      # The provider may delay or drop a scheduled run.
       cron: "15 14 * * 5"
       timezone: America/New_York

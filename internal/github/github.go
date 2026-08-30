@@ -29,17 +29,18 @@ type GitHub interface {
 
 // WorkflowRun is the provider-neutral representation of an Actions run.
 type WorkflowRun struct {
-	ID         int64      `json:"id"`
-	Name       string     `json:"name,omitempty"`
-	Workflow   string     `json:"workflow,omitempty"`
-	Status     string     `json:"status,omitempty"`
-	Conclusion string     `json:"conclusion,omitempty"`
-	Event      string     `json:"event,omitempty"`
-	HeadBranch string     `json:"head_branch,omitempty"`
-	HTMLURL    string     `json:"html_url,omitempty"`
-	CreatedAt  time.Time  `json:"created_at,omitempty"`
-	StartedAt  *time.Time `json:"run_started_at,omitempty"`
-	UpdatedAt  time.Time  `json:"updated_at,omitempty"`
+	ID           int64      `json:"id"`
+	Name         string     `json:"name,omitempty"`
+	DisplayTitle string     `json:"display_title,omitempty"`
+	Workflow     string     `json:"workflow,omitempty"`
+	Status       string     `json:"status,omitempty"`
+	Conclusion   string     `json:"conclusion,omitempty"`
+	Event        string     `json:"event,omitempty"`
+	HeadBranch   string     `json:"head_branch,omitempty"`
+	HTMLURL      string     `json:"html_url,omitempty"`
+	CreatedAt    time.Time  `json:"created_at,omitempty"`
+	StartedAt    *time.Time `json:"run_started_at,omitempty"`
+	UpdatedAt    time.Time  `json:"updated_at,omitempty"`
 }
 
 // Repository identifies a GitHub repository.
@@ -64,50 +65,6 @@ type Client struct {
 const MaxWorkflowLogBytes int64 = 64 << 20
 
 const maxLogRedirects = 5
-
-// Issue is the subset of a GitHub issue returned by CreateIssue.
-type Issue struct {
-	Number  int64  `json:"number"`
-	Title   string `json:"title,omitempty"`
-	Body    string `json:"body,omitempty"`
-	State   string `json:"state,omitempty"`
-	HTMLURL string `json:"html_url,omitempty"`
-}
-
-// IssueCreator is implemented by clients that support dead-letter issues.
-// It is intentionally separate from GitHub so existing lightweight fakes do
-// not need to implement optional functionality.
-type IssueCreator interface {
-	CreateIssue(ctx context.Context, title, body string) (Issue, error)
-}
-
-// GitHubWithIssues combines the required Actions API with optional issue
-// creation for callers that need dead-letter notifications.
-type GitHubWithIssues interface {
-	GitHub
-	IssueCreator
-}
-
-// RepositoryFile is a file in a repository's contents API. SHA can be passed
-// back to PutRepositoryFile for optimistic concurrency.
-type RepositoryFile struct {
-	Path    string
-	SHA     string
-	Content []byte
-}
-
-// StateBranch is the optional branch-backed state API implemented by Client.
-// It is separate from GitHub because state support is not needed by all
-// callers and should not burden their fakes.
-type StateBranch interface {
-	GetStateFile(ctx context.Context, path string) (RepositoryFile, error)
-	PutStateFile(ctx context.Context, path, message string, content []byte, sha string) (RepositoryFile, error)
-}
-
-// StateBranchName is the conventional branch used by the optional state
-// helpers. Callers can use GetRepositoryFile/PutRepositoryFile for another
-// branch.
-const StateBranchName = "ghaas-state"
 
 // NewClient creates a client for owner/name. baseURL is normally
 // https://api.github.com; it is injectable for httptest servers.
@@ -136,12 +93,6 @@ func NewClient(baseURL, owner, name, token string) (*Client, error) {
 // NewClientForRepository uses the supplied repository and token.
 func NewClientForRepository(repo Repository, token string) (*Client, error) {
 	return NewClient("", repo.Owner, repo.Name, token)
-}
-
-// NewHTTPClient is an explicit constructor spelling for callers that prefer
-// to make the transport implementation visible.
-func NewHTTPClient(baseURL, owner, name, token string) (*Client, error) {
-	return NewClient(baseURL, owner, name, token)
 }
 
 // NewClientFromEnv discovers the repository and reads GITHUB_TOKEN.
@@ -224,21 +175,28 @@ func (c *Client) responseError(method, endpoint string, resp *http.Response) err
 func redactURL(endpoint string) string {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return endpoint
+		return ""
 	}
+	u.User = nil
 	u.RawQuery = ""
+	u.ForceQuery = false
 	u.Fragment = ""
 	return u.String()
 }
 
-// DispatchWorkflow triggers workflow_dispatch for ref (usually the default
-// branch). GitHub returns 204 on success.
+// DispatchWorkflow triggers workflow_dispatch for ref. When ref is empty, the
+// repository's current default branch is resolved before dispatching. GitHub
+// returns 204 on success.
 func (c *Client) DispatchWorkflow(ctx context.Context, workflow, ref string, inputs map[string]string) error {
 	if workflow == "" {
 		return errors.New("github: workflow is required")
 	}
-	if ref == "" {
-		ref = "main"
+	if strings.TrimSpace(ref) == "" {
+		var err error
+		ref, err = c.defaultBranch(ctx)
+		if err != nil {
+			return fmt.Errorf("github: resolve default branch: %w", err)
+		}
 	}
 	payload := struct {
 		Ref    string            `json:"ref"`
@@ -246,7 +204,7 @@ func (c *Client) DispatchWorkflow(ctx context.Context, workflow, ref string, inp
 	}{Ref: ref, Inputs: inputs}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("github: encode workflow dispatch: %w", err)
 	}
 	resp, err := c.request(ctx, http.MethodPost, c.endpoint("repos", c.Repository.Owner, c.Repository.Name, "actions", "workflows", workflow, "dispatches"), bytes.NewReader(data))
 	if err != nil {
@@ -258,6 +216,25 @@ func (c *Client) DispatchWorkflow(ctx context.Context, workflow, ref string, inp
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
 	_ = resp.Body.Close()
 	return nil
+}
+
+func (c *Client) defaultBranch(ctx context.Context) (string, error) {
+	endpoint := c.endpoint("repos", c.Repository.Owner, c.Repository.Name)
+	resp, err := c.request(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var repository struct {
+		DefaultBranch string `json:"default_branch"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<10)).Decode(&repository); err != nil {
+		return "", fmt.Errorf("github: decode repository: %w", err)
+	}
+	if strings.TrimSpace(repository.DefaultBranch) == "" {
+		return "", errors.New("github: repository response has no default branch")
+	}
+	return repository.DefaultBranch, nil
 }
 
 // ListWorkflowRuns lists at most limit runs for workflow. A non-positive limit
@@ -295,6 +272,87 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, workflow string, limit in
 	return result.Runs, nil
 }
 
+// ListWorkflowRunsByDisplayTitle follows GitHub pagination and returns only
+// runs whose display title exactly equals displayTitle. It is an optional
+// capability used by CLI explicit-invocation lookups; ListWorkflowRuns keeps
+// its existing one-page/default-latest behavior.
+func (c *Client) ListWorkflowRunsByDisplayTitle(ctx context.Context, workflow, displayTitle string) ([]WorkflowRun, error) {
+	if workflow == "" {
+		return nil, errors.New("github: workflow is required")
+	}
+	if displayTitle == "" {
+		return nil, errors.New("github: display title is required")
+	}
+	u, err := url.Parse(c.endpoint("repos", c.Repository.Owner, c.Repository.Name, "actions", "workflows", workflow, "runs"))
+	if err != nil {
+		return nil, err
+	}
+	query := u.Query()
+	query.Set("per_page", "100")
+	u.RawQuery = query.Encode()
+	next := u.String()
+	var matches []WorkflowRun
+	for next != "" {
+		nextURL, err := url.Parse(next)
+		if err != nil || nextURL.User != nil || !c.sameOrigin(nextURL.String()) {
+			return nil, fmt.Errorf("github: invalid workflow runs pagination URL %q", redactURL(next))
+		}
+		resp, err := c.request(ctx, http.MethodGet, nextURL.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+		var result struct {
+			Runs []WorkflowRun `json:"workflow_runs"`
+		}
+		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		link := resp.Header.Get("Link")
+		_ = resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("github: decode workflow runs: %w", decodeErr)
+		}
+		for _, run := range result.Runs {
+			if run.DisplayTitle == displayTitle {
+				matches = append(matches, run)
+			}
+		}
+		rawNext := nextLink(link)
+		if rawNext == "" {
+			next = ""
+			continue
+		}
+		candidate, err := url.Parse(rawNext)
+		if err != nil {
+			return nil, fmt.Errorf("github: invalid workflow runs pagination URL %q", redactURL(rawNext))
+		}
+		next = nextURL.ResolveReference(candidate).String()
+	}
+	return matches, nil
+}
+
+func nextLink(header string) string {
+	for _, item := range strings.Split(header, ",") {
+		parts := strings.Split(item, ";")
+		if len(parts) < 2 {
+			continue
+		}
+		relNext := false
+		for _, attr := range parts[1:] {
+			if strings.TrimSpace(attr) == `rel="next"` {
+				relNext = true
+				break
+			}
+		}
+		if !relNext {
+			continue
+		}
+		value := strings.TrimSpace(parts[0])
+		if len(value) >= 2 && value[0] == '<' && value[len(value)-1] == '>' {
+			return value[1 : len(value)-1]
+		}
+	}
+	return ""
+}
+
 // GetWorkflowLogs returns a bounded response body from the Actions logs
 // endpoint. GitHub commonly responds with a redirect to a short-lived signed
 // URL; redirects are followed even when a caller's HTTP client disables its
@@ -317,12 +375,13 @@ func (c *Client) GetWorkflowLogs(ctx context.Context, runID int64) (io.ReadClose
 
 func (c *Client) getLogsResponse(ctx context.Context, endpoint string) (*http.Response, error) {
 	current := endpoint
+	authorize := c.sameOrigin(endpoint)
 	client := *c.httpClient()
 	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 	for redirects := 0; ; redirects++ {
-		resp, err := c.doWithHTTPClient(&client, ctx, http.MethodGet, current, nil, c.sameOrigin(current))
+		resp, err := c.doWithHTTPClient(&client, ctx, http.MethodGet, current, nil, authorize)
 		if err != nil {
 			return nil, err
 		}
@@ -343,12 +402,15 @@ func (c *Client) getLogsResponse(ctx context.Context, endpoint string) (*http.Re
 		}
 		next, err := url.Parse(location)
 		if err != nil {
-			return nil, fmt.Errorf("github: invalid workflow logs redirect: %w", err)
+			return nil, fmt.Errorf("github: invalid workflow logs redirect URL %q", redactURL(location))
 		}
 		base, _ := url.Parse(current)
 		next = base.ResolveReference(next)
-		if (next.Scheme != "http" && next.Scheme != "https") || next.Host == "" {
+		if next.User != nil || (next.Scheme != "http" && next.Scheme != "https") || next.Host == "" {
 			return nil, fmt.Errorf("github: invalid workflow logs redirect URL %q", redactURL(next.String()))
+		}
+		if !c.sameOrigin(next.String()) {
+			authorize = false
 		}
 		current = next.String()
 	}
@@ -436,15 +498,13 @@ func ReadLogs(dst io.Writer, src io.Reader) error {
 }
 
 // DiscoverRepository resolves owner/name from GITHUB_REPOSITORY first, then
-// from the origin git remote. It deliberately rejects non-GitHub remotes.
+// from the origin git remote. Non-GitHub remotes are rejected.
 func DiscoverRepository() (Repository, error) {
 	if value := strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY")); value != "" {
-		return parseRepository(value)
+		return ParseRepository(value)
 	}
 	return discoverGitRemote()
 }
-
-func parseRepository(value string) (Repository, error) { return ParseRepository(value) }
 
 // ParseRepository validates the canonical owner/name form.
 func ParseRepository(value string) (Repository, error) {
@@ -472,10 +532,6 @@ func validRepositoryComponent(value string) bool {
 	}
 	return true
 }
-
-// DiscoverRepositoryFromEnv is an explicit alias useful to callers that want
-// to make the source of discovery clear.
-func DiscoverRepositoryFromEnv() (Repository, error) { return DiscoverRepository() }
 
 func discoverGitRemote() (Repository, error) {
 	cmd := exec.Command("git", "remote", "get-url", "origin")
@@ -513,5 +569,5 @@ func discoverGitRemote() (Repository, error) {
 		}
 		remote = strings.TrimPrefix(u.Path, "/")
 	}
-	return parseRepository(remote)
+	return ParseRepository(remote)
 }

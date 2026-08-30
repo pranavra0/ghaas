@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -68,6 +69,64 @@ func TestClientWorkflowLogsFollowsRedirectWithoutLeakingToken(t *testing.T) {
 	}
 }
 
+func TestClientWorkflowLogsNeverRestoresAuthorizationAfterCrossOriginRedirect(t *testing.T) {
+	var gotAuthorization string
+	var apiURL string
+	signed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", apiURL+"/final")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer signed.Close()
+
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/octo/repo/actions/runs/42/logs":
+			w.Header().Set("Location", signed.URL+"/signed")
+			w.WriteHeader(http.StatusFound)
+		case "/final":
+			gotAuthorization = r.Header.Get("Authorization")
+			_, _ = w.Write([]byte("redirected logs\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+	apiURL = api.URL
+
+	client, err := NewClient(api.URL, "octo", "repo", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := client.GetWorkflowLogs(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	data, err := io.ReadAll(body)
+	if err != nil || string(data) != "redirected logs\n" {
+		t.Fatalf("logs = %q, err = %v", data, err)
+	}
+	if gotAuthorization != "" {
+		t.Fatalf("authorization restored after cross-origin redirect: %q", gotAuthorization)
+	}
+}
+
+func TestClientWorkflowLogsRejectsRedirectUserinfo(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://user:password@example.test/signed")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "octo", "repo", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.GetWorkflowLogs(context.Background(), 42); err == nil {
+		t.Fatal("userinfo redirect was accepted")
+	} else if strings.Contains(err.Error(), "password") {
+		t.Fatalf("redirect error leaked userinfo: %v", err)
+	}
+}
 func TestClientWorkflowLogsRejectsOversizedResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "67108865")
