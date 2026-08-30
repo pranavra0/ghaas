@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -156,4 +157,183 @@ func TestReadLogsPlainAndZip(t *testing.T) {
 	if err := ReadLogs(&output, bytes.NewReader(zipped.Bytes())); err != nil || output.String() != "from zip\n" {
 		t.Fatalf("zip = %q, err = %v", output.String(), err)
 	}
+}
+func TestGitDataRefCASAndTypedErrors(t *testing.T) {
+	var force any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/octo/repo/git/ref/heads/state":
+			_, _ = io.WriteString(w, `{"ref":"refs/heads/state","object":{"sha":"old","type":"commit"}}`)
+		case r.Method == http.MethodPatch && r.URL.Path == "/repos/octo/repo/git/refs/heads/state":
+			var payload struct {
+				SHA   string `json:"sha"`
+				Force bool   `json:"force"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatalf("decode update: %v", err)
+			}
+			force = payload.Force
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"message":"ref changed"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "octo", "repo", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, err := client.GetRef(context.Background(), "refs/heads/state")
+	if err != nil || ref.SHA != "old" || ref.Ref != "refs/heads/state" {
+		t.Fatalf("ref = %#v, err = %v", ref, err)
+	}
+	err = client.UpdateRef(context.Background(), "refs/heads/state", "new")
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("update error = %v, want ErrConflict", err)
+	}
+	if force != false {
+		t.Fatalf("force = %#v, want false", force)
+	}
+}
+func TestExactWorkflowRunAttemptAndLogs(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/octo/repo/actions/runs/42":
+			_, _ = io.WriteString(w, `{"id":42,"run_attempt":3,"status":"completed"}`)
+		case "/repos/octo/repo/actions/runs/42/attempts/3":
+			_, _ = io.WriteString(w, `{"id":42,"run_attempt":3,"status":"completed","conclusion":"success"}`)
+		case "/repos/octo/repo/actions/runs/42/attempts/3/logs":
+			_, _ = io.WriteString(w, "attempt logs\n")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "octo", "repo", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := client.GetWorkflowRun(context.Background(), 42)
+	if err != nil || run.ID != 42 || run.RunAttempt != 3 {
+		t.Fatalf("run = %#v, err = %v", run, err)
+	}
+	run, err = client.GetWorkflowRunAttempt(context.Background(), 42, 3)
+	if err != nil || run.Conclusion != "success" || run.RunAttempt != 3 {
+		t.Fatalf("attempt = %#v, err = %v", run, err)
+	}
+	logs, err := client.GetWorkflowAttemptLogs(context.Background(), 42, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logs.Close()
+	var output bytes.Buffer
+	if _, err := io.Copy(&output, logs); err != nil || output.String() != "attempt logs\n" {
+		t.Fatalf("logs = %q, err = %v", output.String(), err)
+	}
+}
+func TestGetTreeWalksNestedStatePathWithoutRecursiveExpansion(t *testing.T) {
+	t.Run("nested path", func(t *testing.T) {
+		var requests []string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.RawQuery != "" {
+				t.Fatalf("tree query = %q, want none", r.URL.RawQuery)
+			}
+			requests = append(requests, r.URL.Path)
+			switch r.URL.Path {
+			case "/repos/octo/repo/git/trees/root":
+				_ = json.NewEncoder(w).Encode(map[string]any{"sha": "root", "tree": []map[string]any{
+					{"path": "unrelated", "type": "blob", "sha": "other"},
+					{"path": ".ghaas", "type": "tree", "sha": "ghaas"},
+				}})
+			case "/repos/octo/repo/git/trees/ghaas":
+				_ = json.NewEncoder(w).Encode(map[string]any{"sha": "ghaas", "tree": []map[string]any{
+					{"path": "state", "type": "tree", "sha": "state"},
+				}})
+			case "/repos/octo/repo/git/trees/state":
+				_ = json.NewEncoder(w).Encode(map[string]any{"sha": "state", "tree": []map[string]any{
+					{"path": "v1.json", "type": "blob", "sha": "blob"},
+				}})
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "octo", "repo", "token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		tree, err := client.GetTree(context.Background(), "root")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tree.Entries) != 1 || tree.Entries[0].Path != ".ghaas/state/v1.json" || tree.Entries[0].SHA != "blob" {
+			t.Fatalf("tree entries = %#v", tree.Entries)
+		}
+		want := []string{
+			"/repos/octo/repo/git/trees/root",
+			"/repos/octo/repo/git/trees/ghaas",
+			"/repos/octo/repo/git/trees/state",
+		}
+		if len(requests) != len(want) {
+			t.Fatalf("tree requests = %#v, want %#v", requests, want)
+		}
+		for i := range want {
+			if requests[i] != want[i] {
+				t.Fatalf("tree request %d = %q, want %q", i, requests[i], want[i])
+			}
+		}
+	})
+
+	t.Run("truncated exact component fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/repos/octo/repo/git/trees/root" {
+				t.Fatalf("unexpected tree path = %q", r.URL.Path)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"truncated": true, "tree": []map[string]any{
+				{"path": ".ghaas", "type": "tree", "sha": "ghaas"},
+			}})
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "octo", "repo", "token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.GetTree(context.Background(), "root"); err == nil {
+			t.Fatal("truncated tree unexpectedly succeeded")
+		}
+	})
+
+	t.Run("malformed exact component fails closed", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/repos/octo/repo/git/trees/root" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"tree": []map[string]any{
+					{"path": ".ghaas", "type": "tree", "sha": "ghaas"},
+				}})
+				return
+			}
+			if r.URL.Path == "/repos/octo/repo/git/trees/ghaas" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"tree": []map[string]any{
+					{"path": "state", "type": "tree", "sha": "state"},
+				}})
+				return
+			}
+			if r.URL.Path == "/repos/octo/repo/git/trees/state" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"tree": []map[string]any{
+					{"path": "v1.json", "type": "blob"},
+				}})
+				return
+			}
+			http.NotFound(w, r)
+		}))
+		defer server.Close()
+		client, err := NewClient(server.URL, "octo", "repo", "token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.GetTree(context.Background(), "root"); err == nil {
+			t.Fatal("malformed state entry unexpectedly succeeded")
+		}
+	})
+
 }

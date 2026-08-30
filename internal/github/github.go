@@ -41,6 +41,8 @@ type WorkflowRun struct {
 	CreatedAt    time.Time  `json:"created_at,omitempty"`
 	StartedAt    *time.Time `json:"run_started_at,omitempty"`
 	UpdatedAt    time.Time  `json:"updated_at,omitempty"`
+	// RunAttempt is the provider's exact attempt number for this run.
+	RunAttempt int `json:"run_attempt,omitempty"`
 }
 
 // Repository identifies a GitHub repository.
@@ -169,7 +171,12 @@ func (c *Client) responseError(method, endpoint string, resp *http.Response) err
 	if message == "" {
 		message = resp.Status
 	}
-	return fmt.Errorf("github: %s %s: %s", method, redactURL(endpoint), message)
+	return &APIError{
+		Method:     method,
+		Endpoint:   endpoint,
+		StatusCode: resp.StatusCode,
+		Message:    message,
+	}
 }
 
 func redactURL(endpoint string) string {
@@ -228,7 +235,7 @@ func (c *Client) defaultBranch(ctx context.Context) (string, error) {
 	var repository struct {
 		DefaultBranch string `json:"default_branch"`
 	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 8<<10)).Decode(&repository); err != nil {
+	if err := decodeBounded(resp.Body, &repository); err != nil {
 		return "", fmt.Errorf("github: decode repository: %w", err)
 	}
 	if strings.TrimSpace(repository.DefaultBranch) == "" {
@@ -263,7 +270,7 @@ func (c *Client) ListWorkflowRuns(ctx context.Context, workflow string, limit in
 	var result struct {
 		Runs []WorkflowRun `json:"workflow_runs"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := decodeBounded(resp.Body, &result); err != nil {
 		return nil, fmt.Errorf("github: decode workflow runs: %w", err)
 	}
 	if limit > 0 && len(result.Runs) > limit {
@@ -304,7 +311,7 @@ func (c *Client) ListWorkflowRunsByDisplayTitle(ctx context.Context, workflow, d
 		var result struct {
 			Runs []WorkflowRun `json:"workflow_runs"`
 		}
-		decodeErr := json.NewDecoder(resp.Body).Decode(&result)
+		decodeErr := decodeBounded(resp.Body, &result)
 		link := resp.Header.Get("Link")
 		_ = resp.Body.Close()
 		if decodeErr != nil {

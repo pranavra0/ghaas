@@ -23,6 +23,9 @@ functions:
     secrets: [TOKEN]
     concurrency:
       max: 1
+    retry:
+      max_attempts: 3
+      backoff: 5s
 `)
 	got, err := Parse(data)
 	if err != nil {
@@ -38,6 +41,9 @@ functions:
 	if fn.Environment["MESSAGE"] != "hello" || len(fn.Secrets) != 1 || fn.Concurrency.Max != 1 {
 		t.Fatalf("unexpected environment values: %#v", fn)
 	}
+	if fn.Retry == nil || fn.Retry.MaxAttempts != 3 || time.Duration(fn.Retry.Backoff) != 5*time.Second {
+		t.Fatalf("unexpected retry values: %#v", fn.Retry)
+	}
 }
 
 func TestDecodeRejectsUnknownAndNonScalarRuntime(t *testing.T) {
@@ -48,13 +54,6 @@ functions:
     runtime: command
     command: [echo]
     state: {backend: memory}
-`,
-		`version: 1
-functions:
-  hello:
-    runtime: command
-    command: [echo]
-    retry: {max_attempts: 2}
 `,
 		`version: 1
 functions:
@@ -95,5 +94,22 @@ func TestEffectiveTimeout(t *testing.T) {
 	explicit := Function{Timeout: Duration(2 * time.Minute)}
 	if got := explicit.EffectiveTimeout(defaults); got != explicit.Timeout {
 		t.Fatalf("explicit timeout = %v, want %v", got, explicit.Timeout)
+	}
+}
+func TestEffectiveRetryDefaults(t *testing.T) {
+	defaults := Defaults{}
+	var omitted Function
+	if got := omitted.EffectiveMaxAttempts(defaults); got != 1 {
+		t.Fatalf("omitted max attempts = %d, want 1", got)
+	}
+	if got := omitted.EffectiveBackoff(defaults); got != 0 {
+		t.Fatalf("omitted backoff = %v, want 0", got)
+	}
+	configured := Function{Retry: &RetryConfig{MaxAttempts: 3, Backoff: Duration(5 * time.Second)}}
+	if got := configured.EffectiveMaxAttempts(defaults); got != 3 {
+		t.Fatalf("configured max attempts = %d, want 3", got)
+	}
+	if got := configured.EffectiveBackoff(defaults); time.Duration(got) != 5*time.Second {
+		t.Fatalf("configured backoff = %v, want 5s", got)
 	}
 }

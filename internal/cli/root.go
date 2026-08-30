@@ -9,15 +9,17 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pranavra0/ghaas/internal/compiler"
 	"github.com/pranavra0/ghaas/internal/github"
+	"github.com/pranavra0/ghaas/internal/state"
 	"github.com/pranavra0/ghaas/pkg/manifest"
 )
 
 const defaultManifest = "ghaas.yaml"
 
-// Services are the seams between handlers and manifest/compiler/provider
+// Services are the seams between handlers and manifest/compiler/provider/state
 // packages. The production command wires these once; tests can replace them
 // without needing a network or process-global state.
 type Services struct {
@@ -33,6 +35,50 @@ type Services struct {
 	Version      string
 	InitTemplate string
 	Stdout       io.Writer
+
+	// State is optional for local development and tests. Production wires the
+	// durable Git Data store here. The CLI only uses Ensure and Get, so a
+	// lightweight fake can stand in for the provider in tests.
+	State           InvocationStore
+	ListInvocations func(context.Context, string, int) ([]InvocationState, error)
+}
+
+// Root owns one command execution and its injected production or test
+// services. Keeping the service bundle on the root preserves the handler
+// seams while allowing production to bind durable state once at startup.
+type Root struct {
+	services Services
+}
+
+// InvocationStore is the durable state seam consumed by the control plane.
+// The variadic attempt parameter preserves the store's default (one attempt)
+// while allowing invoke to pass a manifest retry policy.
+type InvocationStore interface {
+	Ensure(context.Context, string, string, ...int) (state.Invocation, error)
+	Get(context.Context, string, string) (state.Invocation, error)
+}
+
+// InvocationState is the stable control-plane view used by status and logs.
+// Provider is retained as an exact run ID plus run attempt; no provider lookup
+// or inferred "latest" attempt is needed once state has been bound.
+type InvocationState struct {
+	SchemaVersion int          `json:"schema_version"`
+	Function      string       `json:"function"`
+	ID            string       `json:"invocation_id"`
+	Status        string       `json:"status"`
+	Attempts      int          `json:"attempts"`
+	MaxAttempts   int          `json:"max_attempts,omitempty"`
+	CreatedAt     time.Time    `json:"created_at"`
+	StartedAt     *time.Time   `json:"started_at,omitempty"`
+	CompletedAt   *time.Time   `json:"completed_at,omitempty"`
+	LastError     string       `json:"last_error,omitempty"`
+	Provider      *ProviderRef `json:"provider,omitempty"`
+}
+
+type ProviderRef struct {
+	RunID      int64  `json:"run_id"`
+	RunAttempt int    `json:"run_attempt"`
+	Reason     string `json:"reason,omitempty"`
 }
 
 type commandSpec struct {
@@ -51,15 +97,13 @@ var commandTable = []commandSpec{
 	{Name: "validate", Summary: "validate ghaas.yaml", Usage: "ghaas validate", Example: []string{"ghaas validate"}},
 	{Name: "generate", Summary: "print generated workflow YAML", Usage: "ghaas generate [FUNCTION]", Example: []string{"ghaas generate", "ghaas generate weekly"}},
 	{Name: "deploy", Summary: "write generated workflows", Usage: "ghaas deploy [--check] [--function FUNCTION]", Options: "--check                 verify generated workflows without writing\n--function FUNCTION     deploy one function", Flags: []string{"--check", "--function"}, Example: []string{"ghaas deploy", "ghaas deploy --check"}},
-	{Name: "invoke", Summary: "dispatch a function workflow", Usage: "ghaas invoke [--ref REF] FUNCTION", Options: "--ref REF               dispatch ref (empty uses the repository default)", Flags: []string{"--ref"}, Example: []string{"ghaas invoke weekly", "ghaas invoke weekly --ref release"}},
-	{Name: "status", Summary: "show a workflow run", Usage: "ghaas status FUNCTION [--invocation ID]", Options: "--invocation ID         exact logical invocation ID", Flags: []string{"--invocation"}, Example: []string{"ghaas status weekly", "ghaas status weekly --invocation weekly/UUID"}},
-	{Name: "logs", Summary: "show workflow logs", Usage: "ghaas logs FUNCTION [--invocation ID]", Options: "--invocation ID         exact logical invocation ID or provider run ID", Flags: []string{"--invocation"}, Example: []string{"ghaas logs weekly", "ghaas logs weekly --invocation weekly/UUID"}},
+	{Name: "invoke", Summary: "record and dispatch a function", Usage: "ghaas invoke [--ref REF] FUNCTION", Options: "--ref REF               dispatch ref (empty uses the repository default branch)", Flags: []string{"--ref"}, Example: []string{"ghaas invoke weekly", "ghaas invoke weekly --ref release"}},
+	{Name: "status", Summary: "show durable invocation status", Usage: "ghaas status FUNCTION [--invocation ID] [--json]", Options: "--invocation ID         exact logical invocation ID\n--json                   print stable JSON", Flags: []string{"--invocation", "--json"}, Example: []string{"ghaas status weekly", "ghaas status weekly --invocation weekly/UUID", "ghaas status weekly --json"}},
+	{Name: "logs", Summary: "show invocation logs", Usage: "ghaas logs FUNCTION [--invocation ID]", Options: "--invocation ID         exact logical invocation ID or provider run ID", Flags: []string{"--invocation"}, Example: []string{"ghaas logs weekly", "ghaas logs weekly --invocation weekly/UUID"}},
 	{Name: "version", Summary: "print the release version", Usage: "ghaas version", Example: []string{"ghaas version"}},
 	{Name: "completion", Summary: "print shell completion", Usage: "ghaas completion {bash|zsh|fish}", Example: []string{"ghaas completion bash"}},
 	{Name: "runtime invoke", Summary: "execute a function (workflow use only)", Usage: "ghaas runtime invoke FUNCTION", Hidden: true},
 }
-
-type Root struct{ services Services }
 
 func NewRoot(services Services) *Root {
 	if services.ManifestPath == "" {

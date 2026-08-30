@@ -5,7 +5,8 @@ on:
   push:
     branches:
       - main
-
+    tags:
+      - 'v*'
 permissions:
   contents: read
 
@@ -40,9 +41,17 @@ jobs:
 
       - name: Run race tests
         run: go test -race ./...
-
       - name: Build CLI
-        run: go build -trimpath -o "$RUNNER_TEMP/ghaas" ./cmd/ghaas
+        run: go build -trimpath -ldflags "-s -w -X main.ReleaseVersion=v0.0.0-ci" -o "$RUNNER_TEMP/ghaas" ./cmd/ghaas
+      - name: Verify release version embedding
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.ReleaseVersion=${GITHUB_REF_NAME}" \
+            -o "$RUNNER_TEMP/ghaas-release" ./cmd/ghaas
+          test "$("$RUNNER_TEMP/ghaas-release" --version)" = "$GITHUB_REF_NAME"
+
+
 
       - name: Check go mod tidy cleanliness
         shell: bash

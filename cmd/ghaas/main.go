@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,11 +17,23 @@ import (
 	"github.com/pranavra0/ghaas/internal/github"
 	"github.com/pranavra0/ghaas/internal/invocation"
 	ghaasruntime "github.com/pranavra0/ghaas/internal/runtime"
+	"github.com/pranavra0/ghaas/internal/state"
 	"github.com/pranavra0/ghaas/pkg/manifest"
 )
 
 // ReleaseVersion is replaced by release builds with -ldflags -X.
-var ReleaseVersion = "v0.1.0"
+// Development builds deliberately identify as dev and require an explicit
+// released installer version when generating workflows.
+var ReleaseVersion = "dev"
+
+const runtimeVersionEnv = "GHAAS_RUNTIME_VERSION"
+
+func installerVersion() string {
+	if ReleaseVersion == "dev" {
+		return os.Getenv(runtimeVersionEnv)
+	}
+	return ReleaseVersion
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -49,10 +62,18 @@ func execute(ctx context.Context, args []string) (int, error) {
 		if len(args) != 3 {
 			return 1, errors.New("usage: ghaas runtime invoke FUNCTION")
 		}
+		client, err := github.NewClientFromEnv()
+		if err != nil {
+			return 1, err
+		}
+		store := state.New(client)
+		environment := sanitizeRuntimeEnvironment()
 		return ghaasruntime.Invoke(ctx, args[2], ghaasruntime.Options{
 			ManifestPath: "ghaas.yaml",
 			LoadManifest: config.Load,
-			Runner:       invocation.Runner{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr, Env: os.Environ()},
+			Environment:  environment,
+			Runner:       invocation.Runner{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr, Env: environment},
+			Store:        store,
 		})
 	}
 	if err := cli.Run(ctx, args, services()); err != nil {
@@ -61,8 +82,29 @@ func execute(ctx context.Context, args []string) (int, error) {
 	return 0, nil
 }
 
+// sanitizeRuntimeEnvironment removes control-plane credentials from both the
+// runtime process and the environment inherited by configured commands. The
+// GitHub client is constructed before this runs, so it retains its token.
+func sanitizeRuntimeEnvironment() []string {
+	environment := os.Environ()
+	filtered := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		key := entry
+		if index := strings.IndexByte(entry, '='); index >= 0 {
+			key = entry[:index]
+		}
+		if key == "GITHUB_TOKEN" || key == "GH_TOKEN" || strings.HasPrefix(key, "GHAAS_STATE_") {
+			_ = os.Unsetenv(key)
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
 func services() cli.Services {
-	return cli.Services{
+	runtimeVersion := installerVersion()
+	s := cli.Services{
 		ManifestPath: "ghaas.yaml",
 		LoadManifest: config.Load,
 		Validate:     config.Validate,
@@ -72,7 +114,7 @@ func services() cli.Services {
 				return compiler.Artifact{}, fmt.Errorf("function %q not found", function)
 			}
 			return compiler.Compile(function, fn, compiler.Options{
-				GhaasVersion:   ReleaseVersion,
+				GhaasVersion:   runtimeVersion,
 				DefaultTimeout: time.Duration(m.Defaults.Timeout),
 			})
 		},
@@ -81,4 +123,13 @@ func services() cli.Services {
 		WorkflowFor: func(function string) string { return filepath.Base(compiler.WorkflowPath(function)) },
 		Version:     ReleaseVersion,
 	}
+
+	// Bind one provider client to both Actions calls and the Git Data-backed
+	// state store. If no repository/token is available, retain the constructor
+	// seam so help and local development remain usable without GitHub access.
+	if client, err := github.NewClientFromEnv(); err == nil {
+		s.GitHub = client
+		s.State = state.New(client)
+	}
+	return s
 }

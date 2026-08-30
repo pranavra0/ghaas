@@ -64,11 +64,40 @@ func Validate(m manifest.Manifest) error {
 		if timeout > manifest.Duration(6*time.Hour) {
 			problems = append(problems, prefix+": timeout cannot exceed GitHub Actions' 360-minute job limit")
 		}
+		if fn.Retry != nil && fn.Retry.MaxAttempts >= 0 && fn.Retry.Backoff >= 0 {
+			total := retryTotalTimeout(time.Duration(timeout), time.Duration(fn.EffectiveBackoff(m.Defaults)), fn.EffectiveMaxAttempts(m.Defaults))
+			if total <= 0 || total > 6*time.Hour {
+				problems = append(problems, prefix+": retry total timeout cannot exceed GitHub Actions' 360-minute job limit")
+			}
+		}
 	}
 	if len(problems) == 0 {
 		return nil
 	}
 	return &ValidationError{Problems: problems}
+}
+
+func retryTotalTimeout(timeout, backoff time.Duration, maxAttempts int) time.Duration {
+	if timeout <= 0 {
+		timeout = 15 * time.Minute
+	}
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	attempts := int64(maxAttempts)
+	if int64(timeout) > int64(maxDuration)/attempts {
+		return 0
+	}
+	total := timeout * time.Duration(attempts)
+	if attempts > 1 && backoff > 0 {
+		retries := attempts - 1
+		if int64(backoff) > (int64(maxDuration)-int64(total))/retries {
+			return 0
+		}
+		total += backoff * time.Duration(retries)
+	}
+	return total
 }
 
 func validateFunction(prefix string, fn manifest.Function) []string {
@@ -95,6 +124,9 @@ func validateFunction(prefix string, fn manifest.Function) []string {
 	if fn.Timeout != 0 && time.Duration(fn.Timeout) <= 0 {
 		problems = append(problems, prefix+": timeout must be positive")
 	}
+	if fn.Retry != nil {
+		problems = append(problems, validateRetry(prefix, *fn.Retry)...)
+	}
 	if fn.Schedule != nil {
 		problems = append(problems, validateSchedule(prefix, *fn.Schedule)...)
 	}
@@ -102,6 +134,17 @@ func validateFunction(prefix string, fn manifest.Function) []string {
 		problems = append(problems, fmt.Sprintf("%s: concurrency.max must be 1 when specified (got %d)", prefix, fn.Concurrency.Max))
 	}
 	problems = append(problems, validateEnvironment(prefix, fn.Environment, fn.Secrets)...)
+	return problems
+}
+
+func validateRetry(prefix string, retry manifest.RetryConfig) []string {
+	var problems []string
+	if retry.MaxAttempts < 0 {
+		problems = append(problems, fmt.Sprintf("%s: retry.max_attempts must be positive when specified (got %d)", prefix, retry.MaxAttempts))
+	}
+	if retry.Backoff < 0 {
+		problems = append(problems, prefix+": retry.backoff must be positive when specified")
+	}
 	return problems
 }
 
@@ -140,6 +183,9 @@ func validateEnvironment(prefix string, env map[string]string, secrets []string)
 		if isReservedEnvironmentKey(name) {
 			problems = append(problems, fmt.Sprintf("%s: env key %q is reserved", prefix, name))
 		}
+		if manifest.ContainsGitHubExpression(env[name]) {
+			problems = append(problems, fmt.Sprintf("%s: env value for %q contains GitHub expression syntax", prefix, name))
+		}
 		if strings.IndexByte(env[name], 0) >= 0 {
 			problems = append(problems, fmt.Sprintf("%s: env value for %q must not contain NUL", prefix, name))
 		}
@@ -167,10 +213,10 @@ func validateEnvironment(prefix string, env map[string]string, secrets []string)
 	return problems
 }
 
-// GHAAS_* is owned by the runtime. Reserving the prefix, rather than only the
-// currently emitted keys, prevents a manifest from shadowing future metadata.
+// GHAAS_* and GITHUB_TOKEN are owned by the runtime/control plane. Reserving
+// them prevents a manifest from shadowing metadata or the workflow credential.
 func isReservedEnvironmentKey(name string) bool {
-	return strings.HasPrefix(name, "GHAAS_")
+	return manifest.IsReservedEnvironmentKey(name)
 }
 
 // validateCron checks the five POSIX cron fields and their basic ranges. It

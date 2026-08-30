@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pranavra0/ghaas/internal/github"
+	"github.com/pranavra0/ghaas/internal/state"
 )
 
 func (r *Root) client() (github.GitHub, error) {
@@ -52,19 +54,35 @@ func (r *Root) invoke(ctx context.Context, args []string) error {
 	if _, err := selectedFunctions(m, name); err != nil {
 		return err
 	}
-	client, err := r.client()
-	if err != nil {
-		return err
-	}
 	uuid, err := newUUID()
 	if err != nil {
 		return err
 	}
 	logicalID := name + "/" + uuid
-	if err := client.DispatchWorkflow(ctx, r.services.WorkflowFor(name), *ref, map[string]string{"ghaas_invocation_id": uuid}); err != nil {
+	maxAttempts := 1
+	if fn, ok := m.Functions[name]; ok {
+		maxAttempts = fn.EffectiveMaxAttempts(m.Defaults)
+		if maxAttempts < 1 {
+			maxAttempts = 1
+		}
+	}
+	// Ensure is deliberately before dispatch. If dispatch returns an unknown
+	// error, the durable pending record remains the source of truth and a
+	// caller can inspect it without creating a replacement logical ID.
+	if r.services.State != nil {
+		if _, err := r.services.State.Ensure(ctx, name, logicalID, maxAttempts); err != nil {
+			return err
+		}
+	}
+	client, err := r.client()
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(r.services.Stdout, "◆ %s  dispatched\n  %s\n", name, logicalID)
+	fmt.Fprintf(r.services.Stdout, "◆ %s  pending\n  %s\n", name, logicalID)
+	if err := client.DispatchWorkflow(ctx, r.services.WorkflowFor(name), *ref, map[string]string{"ghaas_invocation_id": uuid}); err != nil {
+		fmt.Fprintf(r.services.Stdout, "  dispatch uncertain; inspect with `ghaas status %s --invocation %s`\n", name, logicalID)
+		return fmt.Errorf("dispatch outcome uncertain for %s (inspect with `ghaas status %s --invocation %s`): %w", logicalID, name, logicalID, err)
+	}
 	return nil
 }
 
@@ -136,14 +154,23 @@ type displayTitleLister interface {
 	ListWorkflowRunsByDisplayTitle(context.Context, string, string) ([]github.WorkflowRun, error)
 }
 
+type attemptLogsGetter interface {
+	GetWorkflowAttemptLogs(context.Context, int64, int) (io.ReadCloser, error)
+}
+
+type invocationLister interface {
+	List(context.Context, string, int) ([]state.Invocation, error)
+}
+
 func (r *Root) status(ctx context.Context, args []string) error {
 	fs := newFlags("status")
 	invocationID := fs.String("invocation", "", "exact logical invocation ID")
+	jsonOutput := fs.Bool("json", false, "print stable JSON")
 	if err := fs.Parse(normalizeFlags(args)); err != nil {
 		return errors.New("invalid status options")
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: ghaas status FUNCTION [--invocation ID]")
+		return errors.New("usage: ghaas status FUNCTION [--invocation ID] [--json]")
 	}
 	name := fs.Arg(0)
 	m, err := r.loadAndValidate()
@@ -153,17 +180,64 @@ func (r *Root) status(ctx context.Context, args []string) error {
 	if _, err := selectedFunctions(m, name); err != nil {
 		return err
 	}
-	client, err := r.client()
-	if err != nil {
-		return err
-	}
 	target := strings.TrimSpace(*invocationID)
-	var run github.WorkflowRun
-	var ok, ambiguous bool
 	if target != "" {
 		if err := validateLogicalID(name, target); err != nil {
 			return err
 		}
+		if r.services.State != nil {
+			raw, err := r.services.State.Get(ctx, name, target)
+			if err != nil {
+				return err
+			}
+			return r.printInvocationStatus(name, invocationStateView(raw), *jsonOutput)
+		}
+	} else if r.services.State != nil {
+		lister, ok := r.services.State.(invocationLister)
+		if !ok {
+			return errors.New("durable invocation state does not support listing; use --invocation ID")
+		}
+		raw, err := lister.List(ctx, name, 100)
+		if err != nil {
+			return err
+		}
+		invocations := make([]InvocationState, 0, len(raw))
+		for _, item := range raw {
+			invocations = append(invocations, invocationStateView(item))
+		}
+		inv, ok := latestInvocation(invocations)
+		if !ok {
+			if *jsonOutput {
+				return writeJSON(r.services.Stdout, InvocationState{SchemaVersion: 1, Function: name, Status: "unknown"})
+			}
+			fmt.Fprintln(r.services.Stdout, "Status: no invocations")
+			return nil
+		}
+		return r.printInvocationStatus(name, inv, *jsonOutput)
+	}
+	if r.services.State == nil && r.services.ListInvocations != nil {
+		invocations, err := r.services.ListInvocations(ctx, name, 100)
+		if err != nil {
+			return err
+		}
+		inv, ok := latestInvocation(invocations)
+		if !ok {
+			if *jsonOutput {
+				return writeJSON(r.services.Stdout, InvocationState{SchemaVersion: 1, Function: name, Status: "unknown"})
+			}
+			fmt.Fprintln(r.services.Stdout, "Status: no invocations")
+			return nil
+		}
+		return r.printInvocationStatus(name, inv, *jsonOutput)
+	}
+
+	client, err := r.client()
+	if err != nil {
+		return err
+	}
+	var run github.WorkflowRun
+	var ok, ambiguous bool
+	if target != "" {
 		var runs []github.WorkflowRun
 		if lister, supportsExact := client.(displayTitleLister); supportsExact {
 			runs, err = lister.ListWorkflowRunsByDisplayTitle(ctx, r.services.WorkflowFor(name), canonicalDisplayTitle(target))
@@ -187,12 +261,122 @@ func (r *Root) status(ctx context.Context, args []string) error {
 		}
 		run, ok = latestRun(runs)
 		if !ok {
+			if *jsonOutput {
+				return writeJSON(r.services.Stdout, InvocationState{SchemaVersion: 1, Function: name, Status: "unknown"})
+			}
 			fmt.Fprintln(r.services.Stdout, "Status: no runs")
 			return nil
 		}
 	}
+	if *jsonOutput {
+		return writeJSON(r.services.Stdout, invocationFromRun(name, target, run))
+	}
 	printRunStatus(r.services.Stdout, name, run)
 	return nil
+}
+
+func latestInvocation(invocations []InvocationState) (InvocationState, bool) {
+	if len(invocations) == 0 {
+		return InvocationState{}, false
+	}
+	latest := invocations[0]
+	for _, inv := range invocations[1:] {
+		if inv.CreatedAt.After(latest.CreatedAt) ||
+			(inv.CreatedAt.Equal(latest.CreatedAt) && inv.ID > latest.ID) {
+			latest = inv
+		}
+	}
+	return latest, true
+}
+func invocationStateView(inv state.Invocation) InvocationState {
+	view := InvocationState{
+		SchemaVersion: inv.SchemaVersion,
+		Function:      inv.Function,
+		ID:            inv.ID,
+		Status:        string(inv.Status),
+		Attempts:      inv.Attempts,
+		MaxAttempts:   inv.MaxAttempts,
+		CreatedAt:     inv.CreatedAt,
+		StartedAt:     inv.StartedAt,
+		CompletedAt:   inv.CompletedAt,
+		LastError:     inv.LastError,
+	}
+	if inv.Provider != nil {
+		view.Provider = &ProviderRef{RunID: inv.Provider.RunID, RunAttempt: inv.Provider.RunAttempt, Reason: inv.Provider.Reason}
+	}
+	return view
+}
+
+func (r *Root) printInvocationStatus(function string, inv InvocationState, jsonOutput bool) error {
+	if jsonOutput {
+		return writeJSON(r.services.Stdout, inv)
+	}
+	printStateStatus(r.services.Stdout, function, inv)
+	return nil
+}
+
+func printStateStatus(out io.Writer, function string, inv InvocationState) {
+	display, symbol := durableDisplayStatus(inv.Status)
+	if strings.TrimSpace(inv.Function) != "" {
+		function = inv.Function
+	}
+	fmt.Fprintln(out, function)
+	fmt.Fprintf(out, "%s %s", symbol, display)
+	if inv.Attempts > 0 {
+		if inv.MaxAttempts > 0 {
+			fmt.Fprintf(out, " (attempt %d/%d)", inv.Attempts, inv.MaxAttempts)
+		} else {
+			fmt.Fprintf(out, " (attempt %d)", inv.Attempts)
+		}
+	}
+	if inv.StartedAt != nil && inv.CompletedAt != nil && inv.CompletedAt.After(*inv.StartedAt) {
+		fmt.Fprintf(out, " in %s", humanDuration(inv.CompletedAt.Sub(*inv.StartedAt)))
+	}
+	fmt.Fprintln(out)
+	if !inv.CreatedAt.IsZero() {
+		fmt.Fprintf(out, "  %s\n", humanTimestamp(inv.CreatedAt))
+	}
+	if inv.Provider != nil && inv.Provider.RunID > 0 {
+		fmt.Fprintf(out, "  run %d (attempt %d)\n", inv.Provider.RunID, inv.Provider.RunAttempt)
+	}
+	if strings.TrimSpace(inv.LastError) != "" {
+		fmt.Fprintf(out, "  %s\n", strings.TrimSpace(inv.LastError))
+	}
+}
+
+func durableDisplayStatus(raw string) (string, string) {
+	if strings.EqualFold(strings.TrimSpace(raw), string(state.StatusPending)) {
+		return "pending", "◆"
+	}
+	return displayStatus(raw)
+}
+
+func invocationFromRun(function, logicalID string, run github.WorkflowRun) InvocationState {
+	rawStatus := strings.TrimSpace(run.Conclusion)
+	if rawStatus == "" {
+		rawStatus = strings.TrimSpace(run.Status)
+	}
+	status, _ := displayStatus(rawStatus)
+	id := logicalID
+	if id == "" {
+		id = function + "/" + strconv.FormatInt(run.ID, 10)
+	}
+	return InvocationState{
+		SchemaVersion: 1,
+		Function:      function,
+		ID:            id,
+		Status:        status,
+		CreatedAt:     run.CreatedAt,
+		StartedAt:     run.StartedAt,
+		CompletedAt:   &run.UpdatedAt,
+		Provider:      &ProviderRef{RunID: run.ID, RunAttempt: run.RunAttempt},
+	}
+}
+
+func writeJSON(out io.Writer, value any) error {
+	encoder := json.NewEncoder(out)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(value)
 }
 
 func printRunStatus(out io.Writer, function string, run github.WorkflowRun) {
@@ -203,7 +387,13 @@ func printRunStatus(out io.Writer, function string, run github.WorkflowRun) {
 	status, symbol := displayStatus(rawStatus)
 	fmt.Fprintln(out, function)
 	fmt.Fprintf(out, "%s %s", symbol, status)
-
+	if run.ID > 0 {
+		fmt.Fprintf(out, " (run %d", run.ID)
+		if run.RunAttempt > 0 {
+			fmt.Fprintf(out, ", attempt %d", run.RunAttempt)
+		}
+		fmt.Fprint(out, ")")
+	}
 	start := run.CreatedAt
 	if run.StartedAt != nil && !run.StartedAt.IsZero() {
 		start = *run.StartedAt
@@ -290,21 +480,65 @@ func (r *Root) logs(ctx context.Context, args []string) error {
 	if _, err := selectedFunctions(m, name); err != nil {
 		return err
 	}
-	client, err := r.client()
-	if err != nil {
-		return err
-	}
 	target := strings.TrimSpace(*invocationID)
 	var runID int64
+	var runAttempt int
 	if target != "" {
-		if _, parseErr := strconv.ParseInt(target, 10, 64); parseErr != nil {
+		if parsed, parseErr := strconv.ParseInt(target, 10, 64); parseErr == nil && parsed > 0 {
+			runID = parsed
+		} else {
 			if err := validateLogicalID(name, target); err != nil {
 				return err
 			}
+			if r.services.State != nil {
+				raw, err := r.services.State.Get(ctx, name, target)
+				if err != nil {
+					return err
+				}
+				inv := invocationStateView(raw)
+				if inv.Provider == nil || inv.Provider.RunID <= 0 {
+					return fmt.Errorf("invocation %q has no provider workflow run", target)
+				}
+				runID = inv.Provider.RunID
+				runAttempt = inv.Provider.RunAttempt
+			}
 		}
-		if parsed, parseErr := strconv.ParseInt(target, 10, 64); parseErr == nil && parsed > 0 {
-			runID = parsed
+	} else if r.services.State != nil {
+		lister, ok := r.services.State.(invocationLister)
+		if !ok {
+			return errors.New("durable invocation state does not support listing; use --invocation ID")
 		}
+		raw, err := lister.List(ctx, name, 100)
+		if err != nil {
+			return err
+		}
+		invocations := make([]InvocationState, 0, len(raw))
+		for _, item := range raw {
+			invocations = append(invocations, invocationStateView(item))
+		}
+		inv, ok := latestInvocation(invocations)
+		if !ok || inv.Provider == nil || inv.Provider.RunID <= 0 {
+			return fmt.Errorf("no workflow run for %s", name)
+		}
+		runID = inv.Provider.RunID
+		runAttempt = inv.Provider.RunAttempt
+	}
+	if target == "" && runID == 0 && r.services.State == nil && r.services.ListInvocations != nil {
+		invocations, err := r.services.ListInvocations(ctx, name, 100)
+		if err != nil {
+			return err
+		}
+		inv, ok := latestInvocation(invocations)
+		if !ok || inv.Provider == nil || inv.Provider.RunID <= 0 {
+			return fmt.Errorf("no workflow run for %s", name)
+		}
+		runID = inv.Provider.RunID
+		runAttempt = inv.Provider.RunAttempt
+	}
+
+	client, err := r.client()
+	if err != nil {
+		return err
 	}
 	if runID == 0 {
 		var runs []github.WorkflowRun
@@ -337,11 +571,23 @@ func (r *Root) logs(ctx context.Context, args []string) error {
 			}
 		}
 		runID = run.ID
+		runAttempt = run.RunAttempt
 	}
 	if runID <= 0 {
 		return fmt.Errorf("no workflow run for %s", name)
 	}
-	reader, err := client.GetWorkflowLogs(ctx, runID)
+	var reader io.ReadCloser
+	if runAttempt > 0 {
+		if getter, ok := client.(attemptLogsGetter); ok {
+			reader, err = getter.GetWorkflowAttemptLogs(ctx, runID, runAttempt)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if reader == nil {
+		reader, err = client.GetWorkflowLogs(ctx, runID)
+	}
 	if err != nil {
 		return err
 	}

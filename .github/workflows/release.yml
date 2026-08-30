@@ -1,4 +1,4 @@
-name: Release
+name: Release verification
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   verify:
-    name: Verify
+    name: Verify release
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -23,6 +23,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          version="$GITHUB_REF_NAME"
+          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "release tag is not a valid v-prefixed semantic version: $version" >&2
+            exit 1
+          fi
 
       - name: Download modules
         run: go mod download
@@ -39,8 +48,60 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
-      - name: Run tests
-        run: go test ./...
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Verify embedded version
+        shell: bash
+        run: |
+          go build -trimpath -ldflags "-s -w -X main.ReleaseVersion=${GITHUB_REF_NAME}" \
+            -o "$RUNNER_TEMP/ghaas" ./cmd/ghaas
+          test "$("$RUNNER_TEMP/ghaas" --version)" = "$GITHUB_REF_NAME"
+
+      - name: Check module tidiness
+        shell: bash
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Check generation determinism and golden behavior
+        run: go test ./internal/compiler
+
+      - name: Smoke test CLI in a separate target-repository fixture
+        shell: bash
+        run: |
+          fixture="$RUNNER_TEMP/ghaas-target"
+          binary="$RUNNER_TEMP/ghaas"
+          rm -rf "$fixture"
+          mkdir -p "$fixture/examples/hello"
+          cp examples/hello/ghaas.yaml "$fixture/ghaas.yaml"
+          cp examples/hello/hello.sh "$fixture/examples/hello/hello.sh"
+          (
+            cd "$fixture"
+            "$binary" validate
+            "$binary" generate hello > "$RUNNER_TEMP/ghaas-generated-one.yml"
+            "$binary" generate hello > "$RUNNER_TEMP/ghaas-generated-two.yml"
+            cmp "$RUNNER_TEMP/ghaas-generated-one.yml" "$RUNNER_TEMP/ghaas-generated-two.yml"
+            "$binary" deploy --function hello
+            "$binary" deploy --check
+            printf '%s\n' '# stale generated workflow' > .github/workflows/ghaas-stale.yml
+            if "$binary" deploy --check; then
+              printf '%s\n' 'deploy --check accepted a stale generated workflow'
+              exit 1
+            fi
+            rm .github/workflows/ghaas-stale.yml
+            "$binary" deploy --check
+          )
+
+      - name: Install pinned actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+      - name: Validate repository and generated workflows
+        shell: bash
+        run: |
+          # actionlint 1.7.7 predates GitHub's schedule.timezone key; the
+          # compiler tests parse and assert that provider extension separately.
+          "$(go env GOPATH)/bin/actionlint" -ignore 'element of "schedule" section must be mapping and must contain one key "cron"' .github/workflows/*.yml "$RUNNER_TEMP/ghaas-target"/.github/workflows/*.yml
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -79,14 +140,6 @@ jobs:
 
       - name: Download modules
         run: go mod download
-      - name: Validate release tag
-        shell: bash
-        run: |
-          version="$GITHUB_REF_NAME"
-          if [[ ! "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "release tag is not a valid v-prefixed semantic version: $version" >&2
-            exit 1
-          fi
 
       - name: Build and package
         shell: bash
@@ -110,8 +163,16 @@ jobs:
           else
             tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/dist/$archive" "ghaas$EXT"
           fi
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
 
-      - name: Upload packaged binary
+      - name: Verify package checksum
+        shell: bash
+        run: |
+          archive="$(printf '%s\n' dist/ghaas-* | sed -n 's#^dist/##p' | sed '/\.sha256$/d')"
+          test -n "$archive"
+          (cd dist && sha256sum --check --strict "$archive.sha256")
+
+      - name: Upload verified artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ghaas-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -119,32 +180,71 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: Publish GitHub release
+  checksums:
+    name: Verify artifact checksums
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
-      - name: Check out
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Download packaged binaries
+      - name: Download verified artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
 
-      - name: Create checksums
+      - name: Verify all artifacts
         shell: bash
         run: |
-          (cd dist && sha256sum ghaas-* > SHA256SUMS)
+          set -euo pipefail
+          cd dist
+          for checksum in *.sha256; do
+            sha256sum --check --strict "$checksum"
+          done
+          for archive in ghaas-*.tar.gz ghaas-*.zip; do
+            sha256sum "$archive"
+          done > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
 
-      - name: Verify checksums
-        shell: bash
-        run: (cd dist && sha256sum --check --strict SHA256SUMS)
+      - name: Upload release verification bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ghaas-${{ github.ref_name }}-verified
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - verify
+      - build
+      - checksums
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        run: |
+          set -euo pipefail
+          test -s dist/SHA256SUMS
+          shopt -s nullglob
+          assets=(dist/*)
+          test "${#assets[@]}" -gt 0
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes \
+            "${assets[@]}"

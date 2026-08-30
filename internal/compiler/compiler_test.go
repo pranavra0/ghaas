@@ -19,14 +19,14 @@ func TestCompileV01WorkflowIsDeterministicAndThin(t *testing.T) {
 			Cron:     "15 9 * * 5",
 			Timezone: "America/New_York",
 		},
-		Environment: map[string]string{"ZED": "${{ vars.ZED }}", "A": "plain"},
+		Environment: map[string]string{"ZED": "plain", "A": "plain"},
 		Secrets:     []string{"Z_SECRET", "A_SECRET"},
 	}
-	first, err := Compile("weekly", fn, Options{})
+	first, err := Compile("weekly", fn, Options{GhaasVersion: "v0.1.0"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := Compile("weekly", fn, Options{})
+	second, err := Compile("weekly", fn, Options{GhaasVersion: "v0.1.0"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,24 +48,28 @@ func TestCompileV01WorkflowIsDeterministicAndThin(t *testing.T) {
 		"timezone: America/New_York",
 		"workflow_dispatch:",
 		"ghaas_invocation_id:",
-		"contents: read",
+		"required: true",
+		"contents: write",
+		"persist-credentials: false",
 		"timeout-minutes: 2",
-		"uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
 		`archive="ghaas-${version}-linux-${arch}.tar.gz"`,
 		`base_url="https://github.com/pranavra0/ghaas/releases/download/${version}"`,
 		`--output "$release_dir/SHA256SUMS"`,
 		"sha256sum --check --status",
 		`tar --extract --gzip --file "$release_dir/$archive" --directory "$install_dir"`,
-		"run: ghaas runtime invoke weekly",
+		"run: $RUNNER_TEMP/ghaas-bin/ghaas runtime invoke weekly",
 		"A: plain",
 		"A_SECRET: \"${{ secrets.A_SECRET }}\"",
-		"ZED: \"${{ vars.ZED }}\"",
+		"ZED: plain",
 		"Z_SECRET: \"${{ secrets.Z_SECRET }}\"",
 		"GHAAS_FUNCTION: weekly",
 		"GHAAS_INVOCATION_ID: \"${{ inputs.ghaas_invocation_id }}\"",
 		"GHAAS_ATTEMPT: \"1\"",
 		"GHAAS_TRIGGER: \"${{ github.event_name }}\"",
 		"GHAAS_WORKFLOW_RUN_ID: \"${{ github.run_id }}\"",
+		"GHAAS_WORKFLOW_RUN_ATTEMPT: \"${{ github.run_attempt }}\"",
+		"GITHUB_TOKEN: \"${{ github.token }}\"",
+		"GHAAS_ATTEMPT_REASON: \"${{ github.event_name }}\"",
 	} {
 		if !strings.Contains(output, want) {
 			t.Errorf("generated workflow missing %q:\n%s", want, output)
@@ -81,7 +85,7 @@ func TestCompileV01WorkflowIsDeterministicAndThin(t *testing.T) {
 		t.Error("generated workflow references local compiler source")
 	}
 	for _, forbidden := range []string{
-		"issues: write", "contents: write", "GHAAS_STATE_", "GHAAS_RETRY_",
+		"issues: write", "GHAAS_STATE_", "GHAAS_RETRY_",
 		"GHAAS_SLO_", "GHAAS_SCHEDULE_TARGET", "GHAAS_SCHEDULE_WINDOW",
 		"on_exhausted", "dead-letter", "execution_window",
 	} {
@@ -122,9 +126,48 @@ func TestCompileInstallerReleaseSetting(t *testing.T) {
 		t.Fatal("installer assumes ghaas source in target repository")
 	}
 }
+func TestCompileRefusesImplicitOrDevelopmentInstaller(t *testing.T) {
+	fn := manifest.Function{Runtime: manifest.RuntimeCommand, Command: []string{"echo"}}
+	for _, options := range []Options{{}, {GhaasVersion: "dev"}} {
+		if _, err := Compile("hello", fn, options); err == nil {
+			t.Fatalf("Compile(%#v) succeeded, want installer pin error", options)
+		}
+	}
+}
+
+func TestCompileRetryBudgetAndStatePermission(t *testing.T) {
+	artifact, err := Compile("hello", manifest.Function{
+		Runtime: manifest.RuntimeCommand,
+		Command: []string{"echo"},
+		Timeout: manifest.Duration(2 * time.Minute),
+		Retry:   &manifest.RetryConfig{MaxAttempts: 3, Backoff: manifest.Duration(30 * time.Second)},
+	}, Options{GhaasVersion: "v1.2.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := string(artifact.Content)
+	if !strings.Contains(output, "timeout-minutes: 7") {
+		t.Fatalf("retry budget was not included in job timeout:\n%s", output)
+	}
+	if !strings.Contains(output, "contents: write") {
+		t.Fatalf("state workflow permission missing:\n%s", output)
+	}
+}
+
+func TestCompileRejectsUnboundedRetryBudget(t *testing.T) {
+	_, err := Compile("hello", manifest.Function{
+		Runtime: manifest.RuntimeCommand,
+		Command: []string{"echo"},
+		Timeout: manifest.Duration(4 * time.Hour),
+		Retry:   &manifest.RetryConfig{MaxAttempts: 2},
+	}, Options{GhaasVersion: "v1.2.3"})
+	if err == nil || !strings.Contains(err.Error(), "360-minute") {
+		t.Fatalf("Compile() error = %v, want bounded total timeout error", err)
+	}
+}
 
 func TestCompileRejectsUnsafeReleaseVersion(t *testing.T) {
-	for _, version := range []string{"v1.2.3; echo compromised", "v1.2.3\nGITHUB_TOKEN=leak", "v01.2.3", "1.2.3"} {
+	for _, version := range []string{"v1.2.3; echo compromised", "v1.2.3\nGITHUB_TOKEN=leak", "v01.2.3", "1.2.3", " v1.2.3 "} {
 		if _, err := Compile("hello", manifest.Function{Runtime: manifest.RuntimeCommand, Command: []string{"echo"}}, Options{GhaasVersion: version}); err == nil {
 			t.Fatalf("unsafe release version %q was accepted", version)
 		}
@@ -136,10 +179,30 @@ func TestCompileRejectsEnvSecretCollisionsAndReservedNames(t *testing.T) {
 		{Environment: map[string]string{"TOKEN": "plain"}, Secrets: []string{"TOKEN"}},
 		{Environment: map[string]string{"GHAAS_CUSTOM": "shadow"}},
 		{Secrets: []string{"GHAAS_CUSTOM"}},
+		{Environment: map[string]string{"GITHUB_TOKEN": "shadow"}},
+		{Secrets: []string{"GITHUB_TOKEN"}},
 	}
 	for _, fn := range cases {
-		if _, err := Compile("hello", fn, Options{}); err == nil {
+		if _, err := Compile("hello", fn, Options{GhaasVersion: "v1.2.3"}); err == nil {
 			t.Fatal("expected invalid env/secrets configuration to be rejected")
+		}
+	}
+}
+
+func TestCompileRejectsGitHubExpressionsInLiteralEnvironment(t *testing.T) {
+	for _, value := range []string{
+		"${{ secrets.NOT_DECLARED }}",
+		"prefix ${{ github.token }} suffix",
+		"malformed ${{",
+		"malformed }}",
+	} {
+		_, err := Compile("hello", manifest.Function{
+			Runtime:     manifest.RuntimeCommand,
+			Command:     []string{"echo"},
+			Environment: map[string]string{"VALUE": value},
+		}, Options{GhaasVersion: "v1.2.3"})
+		if err == nil || !strings.Contains(err.Error(), "GitHub expression syntax") {
+			t.Fatalf("Compile accepted literal env expression %q: %v", value, err)
 		}
 	}
 }
@@ -152,7 +215,7 @@ func TestCompileAllSortsConcreteManifestNamesAndInheritsTimeout(t *testing.T) {
 			"z": {Runtime: manifest.RuntimeCommand, Command: []string{"echo", "z"}},
 			"a": {Runtime: manifest.RuntimeCommand, Command: []string{"echo", "a"}},
 		},
-	}, Options{})
+	}, Options{GhaasVersion: "v0.1.0"})
 	if err != nil {
 		t.Fatal(err)
 	}

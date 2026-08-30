@@ -17,10 +17,7 @@ var functionNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 // used by generated installers and release tags.
 var releaseVersionPattern = regexp.MustCompile(`^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 
-const (
-	defaultGhaasRepository = "pranavra0/ghaas"
-	defaultGhaasVersion    = "v0.1.0"
-)
+const defaultGhaasRepository = "pranavra0/ghaas"
 
 // Options controls the released ghaas version and generated job timeout.
 type Options struct {
@@ -36,14 +33,14 @@ func (o Options) DefaultTimeoutValue() time.Duration {
 }
 
 func (o Options) installer() (string, error) {
-	version := strings.TrimSpace(o.GhaasVersion)
-	if version == "" {
-		version = defaultGhaasVersion
-	} else {
-		version = strings.TrimPrefix(version, "@")
-		if !releaseVersionPattern.MatchString(version) {
-			return "", fmt.Errorf("GhaasVersion %q is not a valid release version", o.GhaasVersion)
-		}
+	version := o.GhaasVersion
+	trimmed := strings.TrimSpace(version)
+	if trimmed == "" || strings.EqualFold(trimmed, "dev") {
+		return "", fmt.Errorf("GhaasVersion must be an explicit released version (development builds cannot pin an installer implicitly)")
+	}
+	version = strings.TrimPrefix(version, "@")
+	if !releaseVersionPattern.MatchString(version) {
+		return "", fmt.Errorf("GhaasVersion %q is not a valid release version", o.GhaasVersion)
 	}
 	return `set -euo pipefail
 version="` + version + `"
@@ -70,8 +67,7 @@ curl --fail --location --silent --show-error --retry 3 \
   fi
   printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --status
 )
-tar --extract --gzip --file "$release_dir/$archive" --directory "$install_dir"
-echo "$install_dir" >> "$GITHUB_PATH"`, nil
+tar --extract --gzip --file "$release_dir/$archive" --directory "$install_dir"`, nil
 }
 
 // Artifact is the single generated-workflow representation.

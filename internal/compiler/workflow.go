@@ -18,9 +18,19 @@ const (
 	workflowRunNameFormat   = "ghaas: %s/${{ inputs.ghaas_invocation_id || github.run_id }}"
 )
 
+const maxWorkflowTimeout = 6 * time.Hour
+
 func buildWorkflow(name string, function manifest.Function, options Options) (workflow, error) {
 	if function.Concurrency.Max < 0 || function.Concurrency.Max > 1 {
 		return workflow{}, fmt.Errorf("function %q concurrency.max must be 1", name)
+	}
+	if function.Retry != nil {
+		if function.Retry.MaxAttempts < 0 {
+			return workflow{}, fmt.Errorf("function %q retry.max_attempts must be positive when specified", name)
+		}
+		if function.Retry.Backoff < 0 {
+			return workflow{}, fmt.Errorf("function %q retry.backoff must be positive when specified", name)
+		}
 	}
 	if err := validateEnvironment(function); err != nil {
 		return workflow{}, fmt.Errorf("function %q: %w", name, err)
@@ -49,7 +59,7 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 	inputs := yaml.Node{Kind: yaml.MappingNode}
 	input := yaml.Node{Kind: yaml.MappingNode}
 	addPair(&input, scalar("description"), scalar("ghaas logical invocation UUID"))
-	addPair(&input, scalar("required"), scalarBool(false))
+	addPair(&input, scalar("required"), scalarBool(true))
 	addPair(&input, scalar("type"), scalar("string"))
 	addPair(&inputs, scalar(workflowInvocationInput), &input)
 	addPair(&dispatch, scalar("inputs"), &inputs)
@@ -57,7 +67,7 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 	addPair(&root, scalar("on"), &on)
 
 	permissions := yaml.Node{Kind: yaml.MappingNode}
-	addPair(&permissions, scalar("contents"), scalar("read"))
+	addPair(&permissions, scalar("contents"), scalar("write"))
 	addPair(&root, scalar("permissions"), &permissions)
 
 	concurrency := yaml.Node{Kind: yaml.MappingNode}
@@ -67,7 +77,11 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 
 	job := yaml.Node{Kind: yaml.MappingNode}
 	addPair(&job, scalar("runs-on"), scalar("ubuntu-latest"))
-	minutes, err := timeoutMinutes(function.Timeout, options.DefaultTimeoutValue())
+	totalTimeout, err := retryTimeout(function, options.DefaultTimeoutValue())
+	if err != nil {
+		return workflow{}, fmt.Errorf("function %q timeout: %w", name, err)
+	}
+	minutes, err := timeoutMinutes(manifest.Duration(totalTimeout), 0)
 	if err != nil {
 		return workflow{}, fmt.Errorf("function %q timeout: %w", name, err)
 	}
@@ -76,6 +90,9 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 	steps := yaml.Node{Kind: yaml.SequenceNode}
 	checkout := yaml.Node{Kind: yaml.MappingNode}
 	addPair(&checkout, scalar("uses"), scalar("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"))
+	checkoutWith := yaml.Node{Kind: yaml.MappingNode}
+	addPair(&checkoutWith, scalar("persist-credentials"), scalarBool(false))
+	addPair(&checkout, scalar("with"), &checkoutWith)
 	steps.Content = append(steps.Content, &checkout)
 
 	install, err := options.installer()
@@ -89,7 +106,7 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 
 	invoke := yaml.Node{Kind: yaml.MappingNode}
 	addPair(&invoke, scalar("name"), scalar("Invoke function"))
-	env := make(map[string]string, len(function.Environment)+5)
+	env := make(map[string]string, len(function.Environment)+8)
 	for key, value := range function.Environment {
 		env[key] = value
 	}
@@ -100,6 +117,9 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 	env["GHAAS_ATTEMPT"] = "1"
 	env["GHAAS_TRIGGER"] = "${{ github.event_name }}"
 	env["GHAAS_WORKFLOW_RUN_ID"] = "${{ github.run_id }}"
+	env["GHAAS_WORKFLOW_RUN_ATTEMPT"] = "${{ github.run_attempt }}"
+	env["GHAAS_ATTEMPT_REASON"] = "${{ github.event_name }}"
+	env["GITHUB_TOKEN"] = "${{ github.token }}"
 	for _, key := range sortedSecretNames(function.Secrets) {
 		env[key] = "${{ secrets." + key + " }}"
 	}
@@ -113,7 +133,7 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 		addPair(&envNode, scalar(key), scalarPreserving(env[key]))
 	}
 	addPair(&invoke, scalar("env"), &envNode)
-	addPair(&invoke, scalar("run"), scalar("ghaas runtime invoke "+name))
+	addPair(&invoke, scalar("run"), scalar("$RUNNER_TEMP/ghaas-bin/ghaas runtime invoke "+name))
 	steps.Content = append(steps.Content, &invoke)
 	addPair(&job, scalar("steps"), &steps)
 
@@ -162,6 +182,38 @@ func scalarPreserving(value string) *yaml.Node {
 	return scalar(value)
 }
 
+func retryTimeout(function manifest.Function, fallback time.Duration) (time.Duration, error) {
+	duration := time.Duration(function.Timeout)
+	if duration == 0 {
+		duration = fallback
+	}
+	if duration <= 0 {
+		return 0, fmt.Errorf("must be positive")
+	}
+	maxAttempts := function.EffectiveMaxAttempts(manifest.Defaults{})
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	backoff := time.Duration(function.EffectiveBackoff(manifest.Defaults{}))
+	const maxDuration = time.Duration(1<<63 - 1)
+	attempts := int64(maxAttempts)
+	if int64(duration) > int64(maxDuration)/attempts {
+		return 0, fmt.Errorf("retry total timeout is too large")
+	}
+	total := duration * time.Duration(attempts)
+	if attempts > 1 && backoff > 0 {
+		retries := attempts - 1
+		if int64(backoff) > (int64(maxDuration)-int64(total))/retries {
+			return 0, fmt.Errorf("retry total timeout is too large")
+		}
+		total += backoff * time.Duration(retries)
+	}
+	if total > maxWorkflowTimeout {
+		return 0, fmt.Errorf("retry total timeout cannot exceed GitHub Actions' 360-minute job limit")
+	}
+	return total, nil
+}
+
 func timeoutMinutes(value manifest.Duration, fallback time.Duration) (int, error) {
 	duration := time.Duration(value)
 	if duration == 0 {
@@ -169,6 +221,9 @@ func timeoutMinutes(value manifest.Duration, fallback time.Duration) (int, error
 	}
 	if duration < 0 {
 		return 0, fmt.Errorf("must be positive")
+	}
+	if duration > maxWorkflowTimeout {
+		return 0, fmt.Errorf("cannot exceed GitHub Actions' 360-minute job limit")
 	}
 	return durationMinutes(duration), nil
 }
@@ -188,14 +243,17 @@ func durationMinutes(duration time.Duration) int {
 }
 
 func validateEnvironment(function manifest.Function) error {
-	for name := range function.Environment {
-		if strings.HasPrefix(name, "GHAAS_") {
+	for name, value := range function.Environment {
+		if manifest.IsReservedEnvironmentKey(name) {
 			return fmt.Errorf("env key %q is reserved", name)
+		}
+		if manifest.ContainsGitHubExpression(value) {
+			return fmt.Errorf("env value for %q contains GitHub expression syntax", name)
 		}
 	}
 	seen := make(map[string]struct{}, len(function.Secrets))
 	for _, name := range function.Secrets {
-		if strings.HasPrefix(name, "GHAAS_") {
+		if manifest.IsReservedEnvironmentKey(name) {
 			return fmt.Errorf("secret name %q is reserved", name)
 		}
 		if _, exists := function.Environment[name]; exists {
