@@ -18,8 +18,8 @@ var functionNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 var releaseVersionPattern = regexp.MustCompile(`^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[A-Za-z-][0-9A-Za-z-]*))*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 
 const (
-	defaultGhaasModule  = "github.com/pranavra0/ghaas/cmd/ghaas"
-	defaultGhaasVersion = "v0.1.0"
+	defaultGhaasRepository = "pranavra0/ghaas"
+	defaultGhaasVersion    = "v0.1.0"
 )
 
 // Options controls the released ghaas version and generated job timeout.
@@ -45,8 +45,33 @@ func (o Options) installer() (string, error) {
 			return "", fmt.Errorf("GhaasVersion %q is not a valid release version", o.GhaasVersion)
 		}
 	}
-	return `GOBIN="$RUNNER_TEMP/ghaas-bin" go install ` + defaultGhaasModule + "@" + version +
-		` && echo "$RUNNER_TEMP/ghaas-bin" >> "$GITHUB_PATH"`, nil
+	return `set -euo pipefail
+version="` + version + `"
+case "$(uname -m)" in
+  x86_64) arch="amd64" ;;
+  aarch64|arm64) arch="arm64" ;;
+  *) echo "unsupported runner architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+archive="ghaas-${version}-linux-${arch}.tar.gz"
+base_url="https://github.com/` + defaultGhaasRepository + `/releases/download/${version}"
+release_dir="$RUNNER_TEMP/ghaas-release"
+install_dir="$RUNNER_TEMP/ghaas-bin"
+mkdir -p "$release_dir" "$install_dir"
+curl --fail --location --silent --show-error --retry 3 \
+  --output "$release_dir/$archive" "$base_url/$archive"
+curl --fail --location --silent --show-error --retry 3 \
+  --output "$release_dir/SHA256SUMS" "$base_url/SHA256SUMS"
+(
+  cd "$release_dir"
+  expected="$(awk -v archive="$archive" '$2 == archive { print $1; exit }' SHA256SUMS)"
+  if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]]; then
+    echo "missing or invalid checksum for $archive" >&2
+    exit 1
+  fi
+  printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --status
+)
+tar --extract --gzip --file "$release_dir/$archive" --directory "$install_dir"
+echo "$install_dir" >> "$GITHUB_PATH"`, nil
 }
 
 // Artifact is the single generated-workflow representation.

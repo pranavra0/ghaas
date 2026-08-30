@@ -40,18 +40,13 @@ file starts with:
 
 The file includes `workflow_dispatch`, an optional schedule and timezone, checkout, the
 function timeout, a function concurrency group with `cancel-in-progress: false`, and
-`permissions: contents: read`. Its install step is pinned to the canonical v0.1.0
-release:
-
-```text
-GOBIN="$RUNNER_TEMP/ghaas-bin" go install github.com/pranavra0/ghaas/cmd/ghaas@v0.1.0 && echo "$RUNNER_TEMP/ghaas-bin" >> "$GITHUB_PATH"
-```
-
-The target repository therefore needs no ghaas source tree. It does need a Go toolchain
-compatible with the released module, network access to download the module, and a
-runner that supports `GITHUB_PATH`. The final step is the thin
-`ghaas runtime invoke <function>` entrypoint. There are no state, issue, branch-write,
-retry, lease, or dead-letter steps in v0.1.
+`permissions: contents: read`. Its install step selects the Linux amd64 or arm64
+`ghaas-v0.1.0` release archive, downloads the matching `SHA256SUMS` entry, verifies it,
+and extracts the binary into the runner temp directory before adding it to `GITHUB_PATH`.
+The target repository therefore needs no ghaas source tree or Go toolchain; it needs
+network access to the pinned release and the runner's standard `curl`, `sha256sum`, and
+`tar` tools. The final step is the thin `ghaas runtime invoke <function>` entrypoint.
+There are no state, issue, branch-write, retry, lease, or dead-letter steps in v0.1.
 
 The workflow name is exactly `ghaas: <function>`. The generated run-name expression is
 exactly:
@@ -72,6 +67,8 @@ the UUID as the dispatch input. A scheduled run has no dispatch ID and uses the
 function-scoped `<function>/<github-run-id>` fallback. The provider may delay or omit a
 schedule, so a run ID is an identity for an observed run, not a promise that every cron
 tick runs.
+This run-ID fallback is an explicit v0.1 limitation; deterministic schedule keys and
+durable logical invocation state are v0.2 work.
 
 The runtime exports:
 

@@ -21,15 +21,13 @@ maintainer can still choose a command that exfiltrates data. Generated YAML is d
 the compiler, not a safe place to splice untrusted text into a hand-written `run:` step.
 Do not edit generated files; change the manifest and regenerate them.
 
-The generated installer is pinned to the reviewed canonical release:
-
-```text
-go install github.com/pranavra0/ghaas/cmd/ghaas@v0.1.0
-```
-
-The target repository need not contain ghaas source, but the installer and fetched
-modules are executable code. Review release changes, module updates, scripts, and action
-versions. A compromised dependency or changed release is inside the trust boundary.
+The generated installer is pinned to the reviewed v0.1.0 GitHub release. It downloads the
+selected Linux archive and `SHA256SUMS`, verifies the archive's exact SHA-256 entry before
+extracting the binary, and adds only the runner-temp install directory to `GITHUB_PATH`.
+The target repository need not contain ghaas source or a Go toolchain, but it does need
+network access and the runner's `curl`, `sha256sum`, and `tar` tools. The release and its
+checksum file remain trusted inputs; review release changes, installer scripts, and action
+versions. A compromised release or changed checksum is inside the trust boundary.
 
 ## Environment and secrets
 

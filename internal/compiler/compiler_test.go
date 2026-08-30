@@ -50,7 +50,12 @@ func TestCompileV01WorkflowIsDeterministicAndThin(t *testing.T) {
 		"ghaas_invocation_id:",
 		"contents: read",
 		"timeout-minutes: 2",
-		`GOBIN="$RUNNER_TEMP/ghaas-bin" go install github.com/pranavra0/ghaas/cmd/ghaas@v0.1.0`,
+		"uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+		`archive="ghaas-${version}-linux-${arch}.tar.gz"`,
+		`base_url="https://github.com/pranavra0/ghaas/releases/download/${version}"`,
+		`--output "$release_dir/SHA256SUMS"`,
+		"sha256sum --check --status",
+		`tar --extract --gzip --file "$release_dir/$archive" --directory "$install_dir"`,
 		"run: ghaas runtime invoke weekly",
 		"A: plain",
 		"A_SECRET: \"${{ secrets.A_SECRET }}\"",
@@ -65,6 +70,12 @@ func TestCompileV01WorkflowIsDeterministicAndThin(t *testing.T) {
 		if !strings.Contains(output, want) {
 			t.Errorf("generated workflow missing %q:\n%s", want, output)
 		}
+	}
+	if strings.Index(output, "sha256sum --check --status") > strings.Index(output, "tar --extract --gzip") {
+		t.Error("generated workflow extracts the release before verifying its checksum")
+	}
+	if strings.Contains(output, "go install") {
+		t.Error("generated workflow requires a Go toolchain")
 	}
 	if strings.Contains(output, "./cmd/ghaas") {
 		t.Error("generated workflow references local compiler source")
@@ -90,8 +101,22 @@ func TestCompileInstallerReleaseSetting(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := string(artifact.Content)
-	if !strings.Contains(output, "go install github.com/pranavra0/ghaas/cmd/ghaas@v1.2.3") {
-		t.Fatalf("installer is not pinned to configured release:\n%s", output)
+	for _, want := range []string{
+		`version="v1.2.3"`,
+		`archive="ghaas-${version}-linux-${arch}.tar.gz"`,
+		`https://github.com/pranavra0/ghaas/releases/download/${version}`,
+		`--output "$release_dir/SHA256SUMS"`,
+		"sha256sum --check --status",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("installer is missing %q:\n%s", want, output)
+		}
+	}
+	if strings.Index(output, "sha256sum --check --status") > strings.Index(output, "tar --extract --gzip") {
+		t.Fatal("installer extracts the release before verifying its checksum")
+	}
+	if strings.Contains(output, "go install") {
+		t.Fatal("installer requires a Go toolchain")
 	}
 	if strings.Contains(output, "./cmd/ghaas") {
 		t.Fatal("installer assumes ghaas source in target repository")

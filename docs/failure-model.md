@@ -40,9 +40,9 @@ runner disappears. A later attempt or manual rerun can repeat that request.
 ### Process and installation errors
 
 A missing executable, permission error, non-zero exit, signal, timeout, or cancellation
-makes the invocation unsuccessful. The checkout, Go toolchain, module download, or
-pinned installer can fail before the command starts. These failures are provider/workflow
-failures, not evidence that an external command never ran.
+makes the invocation unsuccessful. The checkout, release archive download, checksum
+verification, extraction, or pinned installer can fail before the command starts. These
+failures are provider/workflow failures, not evidence that an external command never ran.
 
 ### GitHub API uncertainty
 

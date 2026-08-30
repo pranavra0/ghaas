@@ -75,7 +75,7 @@ func buildWorkflow(name string, function manifest.Function, options Options) (wo
 
 	steps := yaml.Node{Kind: yaml.SequenceNode}
 	checkout := yaml.Node{Kind: yaml.MappingNode}
-	addPair(&checkout, scalar("uses"), scalar("actions/checkout@v4"))
+	addPair(&checkout, scalar("uses"), scalar("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"))
 	steps.Content = append(steps.Content, &checkout)
 
 	install, err := options.installer()
