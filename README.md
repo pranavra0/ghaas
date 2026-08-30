@@ -2,11 +2,9 @@
 
 GitHub Actions as a Service.
 
-An extremely questionable serverless platform.
+An extremely serious serverless platform.
 
-The premise is a joke. The failure model isn’t.
-
-## A 20-second demo
+## a tour
 
 In a target repository containing `ghaas.yaml` and `examples/hello/hello.sh`:
 
@@ -63,7 +61,6 @@ ghaas --version
 
 `ghaas.yaml` is strict YAML. It must contain `version: 1` and at least one function. Unknown fields and multiple documents are rejected.
 
-The v0.1 manifest fields are:
 
 - `defaults.timeout`: positive duration inherited by functions without `timeout`; absent
   values use the 15-minute runtime default.
