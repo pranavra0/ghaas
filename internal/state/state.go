@@ -23,11 +23,15 @@ import (
 )
 
 const (
-	SchemaVersion = 1
-	StateRef      = "refs/heads/ghaas-state-v1"
-	StatePath     = ".ghaas/state/v1.json"
-	MaxStateBytes = 1 << 20
-	maxCASRetries = 8
+	SchemaVersion  = 1
+	StateRef       = "refs/heads/ghaas-state-v1"
+	StatePath      = ".ghaas/state/v1.json"
+	MaxStateBytes  = 1 << 20
+	MaxInvocations = 10000
+	maxCASRetries  = 8
+	// Keep enough room for active and retryable records while bounding the
+	// terminal history retained by the aggregate.
+	defaultTerminalRetention = MaxInvocations / 2
 )
 
 // GitData is the GitHub Git Database subset used by the store. UpdateRef is a
@@ -117,9 +121,10 @@ type Invocation struct {
 
 type Option func(*options)
 type options struct {
-	now           func() time.Time
-	leaseDuration time.Duration
-	maxCAS        int
+	now               func() time.Time
+	leaseDuration     time.Duration
+	maxCAS            int
+	terminalRetention int
 }
 
 func WithClock(now func() time.Time) Option {
@@ -144,6 +149,18 @@ func WithMaxCASRetries(max int) Option {
 	}
 }
 
+// WithTerminalRetention limits the number of completed (succeeded or
+// exhausted) records retained in the aggregate. Oldest terminal records are
+// compacted first; pending, running, and retryable failed records are never
+// compacted.
+func WithTerminalRetention(max int) Option {
+	return func(o *options) {
+		if max > 0 {
+			o.terminalRetention = max
+		}
+	}
+}
+
 type Clock interface{ Now() time.Time }
 
 func WithClockSource(clock Clock) Option {
@@ -155,20 +172,32 @@ func WithClockSource(clock Clock) Option {
 }
 
 type Store struct {
-	git           GitData
-	now           func() time.Time
-	leaseDuration time.Duration
-	maxCAS        int
+	git               GitData
+	now               func() time.Time
+	leaseDuration     time.Duration
+	maxCAS            int
+	terminalRetention int
 }
 
 func New(git GitData, opts ...Option) *Store {
-	o := options{now: time.Now, leaseDuration: 5 * time.Minute, maxCAS: maxCASRetries}
+	o := options{
+		now:               time.Now,
+		leaseDuration:     5 * time.Minute,
+		maxCAS:            maxCASRetries,
+		terminalRetention: defaultTerminalRetention,
+	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(&o)
 		}
 	}
-	return &Store{git: git, now: o.now, leaseDuration: o.leaseDuration, maxCAS: o.maxCAS}
+	return &Store{
+		git:               git,
+		now:               o.now,
+		leaseDuration:     o.leaseDuration,
+		maxCAS:            o.maxCAS,
+		terminalRetention: o.terminalRetention,
+	}
 }
 func NewStore(git GitData, opts ...Option) *Store { return New(git, opts...) }
 
@@ -325,21 +354,22 @@ func (s *Store) Renew(ctx context.Context, lease Lease) (Lease, error) {
 		return Lease{}, err
 	}
 	var renewed Lease
-	_, err := s.mutate(ctx, lease.Function, lease.ID, func(doc *document) (Invocation, bool, error) {
+	_, err := s.mutateWithGuard(ctx, lease.Function, lease.ID, func(doc *document) (Invocation, bool, error) {
 		idx, ok := doc.index(lease.Function, lease.ID)
 		if !ok {
 			return Invocation{}, false, fmt.Errorf("%w: %s/%s", ErrNotFound, lease.Function, lease.ID)
 		}
 		cur := doc.Invocations[idx]
-		if err := checkLease(cur, lease, s.now().UTC()); err != nil {
+		now := s.now().UTC()
+		if err := checkLease(cur, lease, now); err != nil {
 			return cur, false, err
 		}
 		renewed = lease
-		renewed.ExpiresAt = s.now().UTC().Add(s.leaseDuration)
+		renewed.ExpiresAt = now.Add(s.leaseDuration)
 		cur.Lease = &renewed
 		doc.Invocations[idx] = cur
 		return cur, true, nil
-	})
+	}, s.leaseExpiryGuard(func() Lease { return renewed }))
 	return renewed, err
 }
 
@@ -353,7 +383,7 @@ func (s *Store) BindProvider(ctx context.Context, lease Lease, runID int64, runA
 
 	var result Invocation
 	var mutateErr error
-	result, mutateErr = s.mutate(ctx, lease.Function, lease.ID, func(doc *document) (Invocation, bool, error) {
+	result, mutateErr = s.mutateWithGuard(ctx, lease.Function, lease.ID, func(doc *document) (Invocation, bool, error) {
 		idx, ok := doc.index(lease.Function, lease.ID)
 		if !ok {
 			return Invocation{}, false, fmt.Errorf("%w: %s/%s", ErrNotFound, lease.Function, lease.ID)
@@ -383,7 +413,7 @@ func (s *Store) BindProvider(ctx context.Context, lease Lease, runID int64, runA
 		cur.Provider = provider
 		doc.Invocations[idx] = cur
 		return cur, true, nil
-	})
+	}, s.leaseExpiryGuard(func() Lease { return lease }))
 	return result, mutateErr
 }
 
@@ -394,16 +424,16 @@ func (s *Store) Complete(ctx context.Context, lease Lease, succeeded bool, resul
 	if err := validLeaseCall(lease); err != nil {
 		return Invocation{}, err
 	}
-	return s.mutate(ctx, lease.Function, lease.ID, func(doc *document) (Invocation, bool, error) {
+	return s.mutateWithGuard(ctx, lease.Function, lease.ID, func(doc *document) (Invocation, bool, error) {
 		idx, ok := doc.index(lease.Function, lease.ID)
 		if !ok {
 			return Invocation{}, false, fmt.Errorf("%w: %s/%s", ErrNotFound, lease.Function, lease.ID)
 		}
 		cur := doc.Invocations[idx]
-		if err := checkLease(cur, lease, s.now().UTC()); err != nil {
+		now := s.now().UTC()
+		if err := checkLease(cur, lease, now); err != nil {
 			return cur, false, err
 		}
-		now := s.now().UTC()
 		cur.CompletedAt = timePtr(now)
 		cur.Lease = nil
 		if len(result) > 0 {
@@ -429,7 +459,7 @@ func (s *Store) Complete(ctx context.Context, lease Lease, succeeded bool, resul
 		}
 		doc.Invocations[idx] = cur
 		return cur, true, nil
-	})
+	}, s.leaseExpiryGuard(func() Lease { return lease }))
 }
 
 func validKey(function, id string) error {
@@ -499,6 +529,57 @@ func (d *document) find(function, id string) (Invocation, bool) {
 	return d.Invocations[i], true
 }
 
+func terminal(in Invocation) bool {
+	return in.Status == StatusSucceeded || in.Status == StatusExhausted
+}
+
+func terminalTime(in Invocation) time.Time {
+	if in.CompletedAt != nil {
+		return in.CompletedAt.UTC()
+	}
+	return in.CreatedAt.UTC()
+}
+
+// compactTerminals retains the newest terminal records. The ordering is
+// explicit so concurrent rebases produce the same retained set regardless of
+// the aggregate's prior physical ordering.
+func compactTerminals(doc *document, retain int) {
+	if retain < 0 {
+		return
+	}
+	terminalIndexes := make([]int, 0)
+	for i, in := range doc.Invocations {
+		if terminal(in) {
+			terminalIndexes = append(terminalIndexes, i)
+		}
+	}
+	if len(terminalIndexes) <= retain {
+		return
+	}
+	sort.Slice(terminalIndexes, func(i, j int) bool {
+		a := doc.Invocations[terminalIndexes[i]]
+		b := doc.Invocations[terminalIndexes[j]]
+		if ta, tb := terminalTime(a), terminalTime(b); !ta.Equal(tb) {
+			return ta.Before(tb)
+		}
+		if a.Function != b.Function {
+			return a.Function < b.Function
+		}
+		return a.ID < b.ID
+	})
+	remove := make(map[int]struct{}, len(terminalIndexes)-retain)
+	for _, idx := range terminalIndexes[:len(terminalIndexes)-retain] {
+		remove[idx] = struct{}{}
+	}
+	kept := doc.Invocations[:0]
+	for i, in := range doc.Invocations {
+		if _, drop := remove[i]; !drop {
+			kept = append(kept, in)
+		}
+	}
+	doc.Invocations = kept
+}
+
 func decode(data []byte) (document, error) {
 	if len(data) > MaxStateBytes {
 		return document{}, fmt.Errorf("%w: state blob exceeds %d bytes", ErrInvalid, MaxStateBytes)
@@ -516,7 +597,7 @@ func decode(data []byte) (document, error) {
 	if doc.SchemaVersion != SchemaVersion {
 		return document{}, fmt.Errorf("%w: unsupported schema version %d", ErrInvalid, doc.SchemaVersion)
 	}
-	if len(doc.Invocations) > 10000 {
+	if len(doc.Invocations) > MaxInvocations {
 		return document{}, fmt.Errorf("%w: too many invocations", ErrInvalid)
 	}
 	if err := validateDocument(doc); err != nil {
@@ -570,6 +651,9 @@ func validateDocument(doc document) error {
 }
 
 func encode(doc document) ([]byte, error) {
+	if len(doc.Invocations) > MaxInvocations {
+		return nil, fmt.Errorf("%w: too many invocations", ErrInvalid)
+	}
 	sort.Slice(doc.Invocations, func(i, j int) bool {
 		a, b := doc.Invocations[i], doc.Invocations[j]
 		if a.Function == b.Function {
@@ -668,6 +752,19 @@ func (s *Store) read(ctx context.Context) (document, string, error) {
 }
 
 func (s *Store) mutate(ctx context.Context, function, id string, fn func(*document) (Invocation, bool, error)) (Invocation, error) {
+	return s.mutateWithGuard(ctx, function, id, fn, nil)
+}
+
+func (s *Store) leaseExpiryGuard(lease func() Lease) func(document) error {
+	return func(_ document) error {
+		if !lease().ExpiresAt.After(s.now().UTC()) {
+			return fmt.Errorf("%w: lease expired", ErrStaleLease)
+		}
+		return nil
+	}
+}
+
+func (s *Store) mutateWithGuard(ctx context.Context, function, id string, fn func(*document) (Invocation, bool, error), finalGuard func(document) error) (Invocation, error) {
 	var zero Invocation
 	for range s.maxCAS {
 		doc, head, err := s.read(ctx)
@@ -684,6 +781,11 @@ func (s *Store) mutate(ctx context.Context, function, id string, fn func(*docume
 		if !changed {
 			return in, nil
 		}
+		retention := s.terminalRetention
+		if retention <= 0 {
+			retention = defaultTerminalRetention
+		}
+		compactTerminals(&doc, retention)
 		body, err := encode(doc)
 		if err != nil {
 			return zero, err
@@ -709,6 +811,14 @@ func (s *Store) mutate(ctx context.Context, function, id string, fn func(*docume
 		commit, err := s.git.CreateCommit(ctx, "ghaas state v1", tree.SHA, parents)
 		if err != nil {
 			return zero, mapGitError(err)
+		}
+		// Lease validity is checked again after all fallible network work and
+		// immediately before the provider CAS. A lease that expires during
+		// blob/tree/commit creation must not publish its stale transition.
+		if finalGuard != nil {
+			if guardErr := finalGuard(doc); guardErr != nil {
+				return in, guardErr
+			}
 		}
 		if head == "" {
 			err = s.git.CreateRef(ctx, StateRef, commit.SHA)

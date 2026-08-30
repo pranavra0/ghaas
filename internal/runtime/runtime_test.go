@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -182,6 +183,7 @@ type durableRuntimeStore struct {
 	completeCtxErr      error
 	completeHasDeadline bool
 	exhaustOnFailure    bool
+	acquireErr          error
 }
 
 func (s *durableRuntimeStore) Ensure(_ context.Context, function, id string, maxAttempts ...int) (state.Invocation, error) {
@@ -201,6 +203,9 @@ func (s *durableRuntimeStore) Ensure(_ context.Context, function, id string, max
 
 func (s *durableRuntimeStore) Acquire(ctx context.Context, function, id, owner string) (state.Invocation, state.Lease, error) {
 	s.acquires++
+	if s.acquireErr != nil {
+		return s.invocation, state.Lease{}, s.acquireErr
+	}
 	s.invocation.Attempts++
 	s.invocation.Function, s.invocation.ID = function, id
 	s.invocation.Status = state.StatusRunning
@@ -236,6 +241,37 @@ func (s *durableRuntimeStore) Complete(ctx context.Context, _ state.Lease, succe
 		s.invocation.Status = state.StatusFailed
 	}
 	return s.invocation, nil
+}
+
+func TestInvokeDurableDoesNotRecoverActiveLeaseConflict(t *testing.T) {
+	m := manifest.Manifest{Version: 1, Functions: map[string]manifest.Function{
+		"active": {Runtime: manifest.RuntimeCommand, Command: []string{"printf", "executed"}},
+	}}
+	activeLease := state.Lease{Function: "active", ID: "active/conflict", Owner: "other-worker", Token: "opaque", Fence: 1, ExpiresAt: time.Now().Add(time.Hour)}
+	store := &durableRuntimeStore{
+		invocation: state.Invocation{
+			Function: "active", ID: "active/conflict", Status: state.StatusRunning,
+			MaxAttempts: 1, Attempts: 1, Lease: &activeLease,
+		},
+		acquireErr: fmt.Errorf("%w: active/conflict", state.ErrLeaseHeld),
+	}
+	var out bytes.Buffer
+	slept := false
+	code, err := Invoke(context.Background(), "active", Options{
+		LoadManifest: runtimeLoader(m), Store: store, Owner: "new-worker",
+		Environment: []string{"GHAAS_INVOCATION_ID=conflict"},
+		Stdout:      &out, Stderr: &out,
+		Sleep: func(context.Context, time.Duration) error {
+			slept = true
+			return nil
+		},
+	})
+	if code != 1 || !errors.Is(err, state.ErrLeaseHeld) {
+		t.Fatalf("active lease conflict = %d, %v; want ErrLeaseHeld", code, err)
+	}
+	if store.acquires != 1 || store.completes != 0 || slept || out.Len() != 0 {
+		t.Fatalf("conflict recovery acquires=%d completes=%d slept=%v output=%q; want no recovery or command", store.acquires, store.completes, slept, out.String())
+	}
 }
 
 func TestInvokeDurableRetriesWithLogicalMetadata(t *testing.T) {

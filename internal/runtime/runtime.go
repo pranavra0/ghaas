@@ -152,6 +152,16 @@ func invokeDurable(ctx context.Context, function, id string, m manifest.Manifest
 	for {
 		current, lease, err := options.Store.Acquire(ctx, function, id, owner)
 		if err != nil {
+			if errors.Is(err, state.ErrLeaseHeld) {
+				// Do not poll or reclaim an active lease here. Its holder may
+				// still be running the command, and a bounded wait cannot
+				// distinguish that case from a dead worker. Reacquiring after
+				// expiry could launch a second external effect while the first
+				// command is still running; fencing only protects durable
+				// state writes. Leave recovery to a later invocation after the
+				// lease expires rather than risk duplicate command execution.
+				return 1, err
+			}
 			return 1, err
 		}
 		if strings.EqualFold(string(current.Status), "succeeded") {

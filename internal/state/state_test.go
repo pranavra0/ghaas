@@ -12,15 +12,16 @@ import (
 )
 
 type fakeGitData struct {
-	mu         sync.Mutex
-	refs       map[string]string
-	blobs      map[string][]byte
-	trees      map[string]github.GitTree
-	commits    map[string]github.GitCommit
-	next       int
-	createRefs int
-	updates    int
-	conflicts  int
+	mu                 sync.Mutex
+	refs               map[string]string
+	blobs              map[string][]byte
+	trees              map[string]github.GitTree
+	commits            map[string]github.GitCommit
+	next               int
+	createRefs         int
+	updates            int
+	conflicts          int
+	beforeCreateCommit func()
 }
 
 func newFakeGitData() *fakeGitData {
@@ -78,6 +79,9 @@ func (f *fakeGitData) GetCommit(_ context.Context, sha string) (github.GitCommit
 func (f *fakeGitData) CreateCommit(_ context.Context, message, treeSHA string, parents []string) (github.GitCommit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.beforeCreateCommit != nil {
+		f.beforeCreateCommit()
+	}
 	sha := f.id("c")
 	c := github.GitCommit{SHA: sha, TreeSHA: treeSHA, Message: message}
 	f.commits[sha] = c
@@ -386,5 +390,124 @@ func TestListSortsNewestBeforeApplyingLimit(t *testing.T) {
 	}
 	if len(tied) != 1 || tied[0].ID != "alpha/z" {
 		t.Fatalf("tie-broken latest invocation = %#v", tied)
+	}
+}
+
+func TestLeaseExpiryIsCheckedAtFinalCASBoundary(t *testing.T) {
+	git := newFakeGitData()
+	clock := &fakeClock{now: time.Unix(500, 0).UTC()}
+	store := New(git, WithClockSource(clock), WithLeaseDuration(time.Minute))
+	ctx := context.Background()
+	if _, err := store.Ensure(ctx, "fn", "fn/final-cas", 1); err != nil {
+		t.Fatal(err)
+	}
+	_, lease, err := store.Acquire(ctx, "fn", "fn/final-cas", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	updatesBefore := git.updates
+	advanced := false
+	git.beforeCreateCommit = func() {
+		if !advanced {
+			advanced = true
+			clock.Advance(2 * time.Minute)
+		}
+	}
+	if _, err := store.Complete(ctx, lease, true); !errors.Is(err, ErrStaleLease) {
+		t.Fatalf("completion after expiry = %v, want stale lease", err)
+	}
+	if git.updates != updatesBefore {
+		t.Fatalf("stale completion updated ref: before=%d after=%d", updatesBefore, git.updates)
+	}
+	stored, err := store.Get(ctx, "fn", "fn/final-cas")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != StatusRunning || stored.Lease == nil {
+		t.Fatalf("stale completion changed durable state: %#v", stored)
+	}
+}
+
+func TestTerminalCompactionPreservesNonTerminalRecords(t *testing.T) {
+	git := newFakeGitData()
+	clock := &fakeClock{now: time.Unix(600, 0).UTC()}
+	store := New(git, WithClockSource(clock), WithTerminalRetention(1))
+	ctx := context.Background()
+
+	if _, err := store.Ensure(ctx, "fn", "fn/old", 1); err != nil {
+		t.Fatal(err)
+	}
+	_, oldLease, err := store.Acquire(ctx, "fn", "fn/old", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Complete(ctx, oldLease, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Ensure(ctx, "fn", "fn/failed", 2); err != nil {
+		t.Fatal(err)
+	}
+	_, failedLease, err := store.Acquire(ctx, "fn", "fn/failed", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Complete(ctx, failedLease, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Ensure(ctx, "fn", "fn/pending", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Ensure(ctx, "fn", "fn/running", 1); err != nil {
+		t.Fatal(err)
+	}
+	_, runningLease, err := store.Acquire(ctx, "fn", "fn/running", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clock.Advance(time.Second)
+	if _, err := store.Ensure(ctx, "fn", "fn/new", 1); err != nil {
+		t.Fatal(err)
+	}
+	_, newLease, err := store.Acquire(ctx, "fn", "fn/new", "worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Complete(ctx, newLease, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := store.Get(ctx, "fn", "fn/old"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old terminal record = %v, want compacted", err)
+	}
+	pending, err := store.Get(ctx, "fn", "fn/pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Status != StatusPending {
+		t.Fatalf("pending record after compaction = %#v", pending)
+	}
+	running, err := store.Get(ctx, "fn", "fn/running")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running.Status != StatusRunning || running.Lease == nil || running.Lease.Fence != runningLease.Fence {
+		t.Fatalf("running record after compaction = %#v", running)
+	}
+	failed, err := store.Get(ctx, "fn", "fn/failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failed.Status != StatusFailed || failed.Lease != nil {
+		t.Fatalf("retryable failed record after compaction = %#v", failed)
+	}
+	latest, err := store.Get(ctx, "fn", "fn/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Status != StatusSucceeded {
+		t.Fatalf("new terminal record after compaction = %#v", latest)
 	}
 }

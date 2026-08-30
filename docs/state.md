@@ -15,8 +15,19 @@ conflict loop re-reads the new head and rebases the mutation. The local checkout
 is never used as a state backend, and there is no local `BranchStore`.
 
 The aggregate is deliberately coordination state rather than a general-purpose
-database. It has bounded size/count and deterministic record ordering. A missing
-state ref is treated as an empty aggregate and is created by the first mutation.
+database. Its serialized form is limited to 1 MiB, and readers reject documents
+with more than 10,000 invocations. On every changed mutation, the store
+compacts terminal records across the whole aggregate to its configured
+retention: by default it retains the newest 5,000 records whose status is
+`succeeded` or `exhausted`. `WithTerminalRetention(max)` can set a different
+positive cap. The oldest terminal records are removed first, ordered by
+completion time (falling back to creation time when absent), with function and
+invocation ID as deterministic tie-breakers. `pending`, `running`, and retryable
+`failed` records are never compacted.
+Compaction is write-triggered, not a background job or a read-time eviction, and
+the aggregate size/count limits still apply to active records, retained
+terminals, and individual record contents. A missing state ref is treated as an
+empty aggregate and is created by the first mutation.
 
 ## Access required
 
@@ -62,9 +73,20 @@ notification, execution window, or SLO fields.
 ## Leases and provider references
 
 A running record carries a lease with owner, opaque token, monotonically
-increasing fence, and expiry. Acquire, renew, bind-provider, and complete
-operations verify all lease values. A stale token, fence, owner, or expired lease
-is rejected; stale writers cannot overwrite a newer worker's result.
+increasing fence, and expiry. Acquire, renew, bind-provider, and complete check
+lease values against the snapshot they read before attempting the GitHub ref
+CAS. For a changed lease renewal, provider binding, or completion, the store
+checks expiry again after blob/tree/commit creation and immediately before the
+provider ref operation, so expiry during that object-building work is rejected
+without publishing the stale transition.
+That final check is not atomic with `UpdateRef`: the lease can expire after the
+check while the provider request is in flight, and `UpdateRef` has no lease
+clock to enforce. The provider's non-force CAS detects a competing ref history,
+not this expiry, so an operation may still be accepted after wall-clock expiry.
+Fencing prevents a stale write from overwriting a newer commit that already won
+the CAS race, but does not provide an atomic expiry cutoff. Acquire can recover
+a lease observed as expired by assigning a new token and higher fence; an active
+lease instead returns `ErrLeaseHeld`.
 
 Provider metadata is retained exactly as `run_id` plus `run_attempt` (with the
 provider reason where available). Status is durable-state-first. Logs use the
